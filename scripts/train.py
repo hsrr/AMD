@@ -343,7 +343,25 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12):
+def train_model(
+    rank,
+    AMD_init_pth,
+    train_js,
+    val_js,
+    world_size,
+    dataset_name,
+    batch_size=6,
+    use_lora=False,
+    epochs=10,
+    lr=1e-6,
+    eval_steps=10,
+    run_name=None,
+    max_val_item_count=1000,
+    regular_weight=0.07,
+    train_domain='NYT',
+    random_seed=12,
+    use_bbox_supervision=True,
+):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
@@ -387,6 +405,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             "dataset": dataset_name,
             "batch_size": batch_size,
             "use_lora": use_lora,
+            "use_bbox_supervision": use_bbox_supervision,
             
             "epochs": epochs,
             "learning_rate": lr,
@@ -479,11 +498,12 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         model.train()
         train_loss = 0
         LLM_loss = 0
-        loss_list = []
         image_loss = 0
         text_loss = 0
         LT_loss = 0
-        loss_regular = 0
+        bbox_loss_total = 0
+        giou_loss_total = 0
+        regular_loss_total = 0
         for batch in tqdm(
             train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}", position=rank
         ):
@@ -516,6 +536,12 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
             logits_list = outputs.classification_logits_list
             ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
+            step_image_loss = 0.0
+            step_text_loss = 0.0
+            step_LT_loss = 0.0
+            step_bbox_loss = 0.0
+            step_giou_loss = 0.0
+            step_regular_loss = 0.0
             
             for i,logits in enumerate(logits_list):
                 if logits is not None:
@@ -524,37 +550,37 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                         if torch.isnan(temp_loss0):
                             raise RuntimeError(f"❌ logits_list[{i}] 产生 NaN，二分类损失 temp_loss0 为 NaN")
                         total_loss += 0.1*temp_loss0 
-                        loss_list.append(temp_loss0)
+                        step_image_loss = temp_loss0.item()
                     if i == 1:
                         temp_loss1 = criterion(logits,Binary_lables) 
                         if torch.isnan(temp_loss1):
                             raise RuntimeError(f"❌ logits_list[{i}]  temp_loss1 = NaN")
                         total_loss += 0.1*temp_loss1 
-                        loss_list.append(temp_loss1)
+                        step_text_loss = temp_loss1.item()
                     if i == 2:
                         temp_loss2 = criterion(logits,Binary_lables) 
                         if torch.isnan(temp_loss2):
                             raise RuntimeError(f"❌ logits_list[{i}]  temp_loss2 = NaN")
                         total_loss += 0.1*temp_loss2 
-                        loss_list.append(temp_loss2)
+                        step_LT_loss = temp_loss2.item()
                         
-                    if i == 3: ##utput_coord
+                    if i == 3 and use_bbox_supervision: ##utput_coord
                         output_coords = logits.to(device)
                         tensor_fake_image_box = torch.cat(fake_image_box, dim=0).reshape(len(fake_image_box), -1).to(device)
-                        loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box) 
-                        if torch.isnan(loss_bbox):
+                        bbox_loss, giou_loss = get_bbox_loss(output_coords, tensor_fake_image_box) 
+                        if torch.isnan(bbox_loss):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
-                        total_loss += 0.1*(loss_bbox+loss_giou) 
-                        loss_list.append(loss_bbox)
-                        loss_list.append(loss_giou)
+                        total_loss += 0.1*(bbox_loss + giou_loss) 
+                        step_bbox_loss = bbox_loss.item()
+                        step_giou_loss = giou_loss.item()
                     
                     if i == 4: 
-                        loss_regular = logits.to(device)
-                        if torch.isnan(loss_regular):
+                        regular_loss = logits.to(device)
+                        if torch.isnan(regular_loss):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_regular = NaN")
-                        loss_regular = regular_weight * loss_regular
-                        loss_list.append(loss_regular)
-                        total_loss += loss_regular
+                        regular_loss = regular_weight * regular_loss
+                        total_loss += regular_loss
+                        step_regular_loss = regular_loss.item()
 
     
             total_loss.backward()
@@ -565,26 +591,25 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
             train_loss += total_loss.item()
             LLM_loss += outputs.loss.item()
-            image_loss += loss_list[0].item()
-            text_loss += loss_list[1].item()
-            LT_loss += loss_list[2].item()
-            loss_bbox += loss_list[3].item()
-            loss_giou += loss_list[4].item()
-            loss_regular += loss_list[5].item()
+            image_loss += step_image_loss
+            text_loss += step_text_loss
+            LT_loss += step_LT_loss
+            bbox_loss_total += step_bbox_loss
+            giou_loss_total += step_giou_loss
+            regular_loss_total += step_regular_loss
             
             
             
             if rank == 0:
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
-                wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
-                wandb.log({"step": global_step + 1, "step_avg_text_loss": loss_list[1].item()})
-                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": loss_list[2].item()})
-                wandb.log({"step": global_step + 1, "step_avg_bbox_loss": loss_list[3].item()})
-                wandb.log({"step": global_step + 1, "step_avg_giou_loss": loss_list[4].item()})
-                wandb.log({"step": global_step + 1, "step_avg_regular_loss": loss_list[5].item()})
+                wandb.log({"step": global_step + 1, "step_avg_image_loss": step_image_loss})
+                wandb.log({"step": global_step + 1, "step_avg_text_loss": step_text_loss})
+                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": step_LT_loss})
+                wandb.log({"step": global_step + 1, "step_avg_bbox_loss": step_bbox_loss})
+                wandb.log({"step": global_step + 1, "step_avg_giou_loss": step_giou_loss})
+                wandb.log({"step": global_step + 1, "step_avg_regular_loss": step_regular_loss})
                 
-            loss_list.clear()    
             global_step += 1
 
             if global_step % eval_steps == 0:
@@ -598,9 +623,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         avg_image_loss = image_loss / len(train_loader)
         avg_text_loss = text_loss / len(train_loader)
         avg_LT_loss = LT_loss / len(train_loader)
-        avg_bbox_loss = loss_bbox / len(train_loader)
-        avg_giou_loss = loss_giou / len(train_loader)
-        avg_regular_loss = loss_regular / len(train_loader)
+        avg_bbox_loss = bbox_loss_total / len(train_loader)
+        avg_giou_loss = giou_loss_total / len(train_loader)
+        avg_regular_loss = regular_loss_total / len(train_loader)
     
         
         if rank == 0:
@@ -646,6 +671,11 @@ def main():
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
+    parser.add_argument(
+        "--disable-bbox-supervision",
+        action='store_true',
+        help="Disable bbox/GIoU supervision losses during training",
+    )
     
     
     
@@ -658,7 +688,24 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain),
+        args=(
+            args.AMD_init_pth,
+            args.train_js,
+            args.val_js,
+            world_size,
+            args.dataset_type,
+            args.batch_size,
+            args.use_lora,
+            args.epochs,
+            args.lr,
+            args.eval_steps,
+            args.run_name,
+            args.max_val_item_count,
+            args.regular_weight,
+            args.train_domain,
+            args.seed,
+            not args.disable_bbox_supervision,
+        ),
         nprocs=world_size,
         join=True
     )

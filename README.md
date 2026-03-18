@@ -115,7 +115,11 @@ sh test.sh
 Please run:
 
 ```shell
+# Original training (with bbox supervision)
 sh train.sh
+
+# Training without bbox supervision signal
+sh train_no_bbox.sh
 ```
 Please fill the MODEL_PATH, TRAIN_JS, and VAL_JS with your real checkpoint path and data path.
 

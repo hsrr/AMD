@@ -1,8 +1,8 @@
 #!/bin/bash
 
-random_seed=12 
+random_seed=12
 export PYTHONHASHSEED=$random_seed
-export CUDA_VISIBLE_DEVICES=0,1,2,3  
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 MODEL_PTH='AMD/models'
 TRAIN_JS='path/to/train.json'
@@ -15,12 +15,13 @@ python scripts/train.py \
     --epochs 13 \
     --lr 1e-6 \
     --eval-steps 2000 \
-    --run-name "amd_train_run_$(date +%Y%m%d_%H%M)" \
+    --run-name "amd_train_no_bbox_$(date +%Y%m%d_%H%M)" \
     --max-val-item-count 2000 \
     --regular-weight 2000 \
     --train-js "$TRAIN_JS" \
     --val-js "$VAL_JS" \
-    --train-domain "NYT"\
-    --seed $random_seed
+    --train-domain "NYT" \
+    --seed $random_seed \
+    --disable-bbox-supervision
 
-echo "Training completed at: $(date)"
+echo "Training without bbox supervision completed at: $(date)"
