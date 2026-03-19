@@ -11,6 +11,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 from data import DGM4_Dataset
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import roc_auc_score
 import numpy as np
 import sys, re
 from multilabel_metrics import AveragePrecisionMeter
@@ -47,7 +48,12 @@ def get_best_option(generated_texts, option_vectors,vectorizer,options,option_la
     # 是A. No.的地方设置为 0 --代表real图文
     pred_label[real_label_pos] = 0
     
-    return best_options, best_similarities, best_multi_labels,pred_label
+    sim_tensor = torch.tensor(similarities, dtype=torch.float32, device=device)
+    option_probs = torch.softmax(sim_tensor, dim=1)
+    # option index 0 is "A. No." (real), so fake score uses the remaining mass.
+    fake_scores = 1.0 - option_probs[:, 0]
+    
+    return best_options, best_similarities, best_multi_labels, pred_label, fake_scores
 
 def get_multi_label(answers,device):
     # 初始化 multi_label 矩阵
@@ -150,11 +156,30 @@ def parse_coordinates(text):
         # print('没有match')
         return torch.tensor([[0, 0, 0, 0]])
 
+
+def compute_binary_metrics_from_scores(y_true, y_score, threshold=0.5):
+    y_true = np.asarray(y_true, dtype=np.int64)
+    y_score = np.asarray(y_score, dtype=np.float64)
+    if y_true.size == 0:
+        return 0.0, 1.0, float("nan")
+
+    y_pred = (y_score >= threshold).astype(np.int64)
+    acc = float((y_pred == y_true).mean())
+    err = 1.0 - acc
+
+    if np.unique(y_true).size < 2:
+        auc = float("nan")
+    else:
+        auc = float(roc_auc_score(y_true, y_score))
+    return acc, err, auc
+
 def evaluate_model(test_loader, model, processer,device,option_vectors,vectorizer,options,option_labels):
 
     IOU_pred = []
     cls_nums_all = 0
     cls_acc_all = 0   
+    cls_true_labels = []
+    cls_fake_scores = []
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
@@ -184,7 +209,7 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
         real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
         real_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
         real_label[real_label_pos] = 0
-        best_options, _ ,best_multi_labels,pred_label = get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
+        best_options, _ ,best_multi_labels,pred_label, fake_scores = get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
         IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
 
         # IOU_pred.extend(IOU.cpu().tolist())
@@ -197,6 +222,8 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
         ##--reeal/fake---##
         cls_nums_all += len(generated_texts)
         cls_acc_all += torch.sum(real_label == pred_label).item()
+        cls_true_labels.extend(real_label.detach().cpu().tolist())
+        cls_fake_scores.extend(fake_scores.detach().cpu().tolist())
         ##-multi--##
         multi_label_meter.add(best_multi_labels, real_multi_label)
         
@@ -205,12 +232,31 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
     
     
     ACC_cls = cls_acc_all / cls_nums_all
+    ACC_from_scores, ERR_from_scores, AUC_from_scores = compute_binary_metrics_from_scores(
+        cls_true_labels, cls_fake_scores
+    )
     
     MAP = multi_label_meter.value()[:3].mean()
     
     OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
 
-    return ACC_cls, cls_acc_all, cls_nums_all, MAP,OP, OR, OF1, CP, CR, CF1,IOU_score,IOU_pred
+    return (
+        ACC_cls,
+        cls_acc_all,
+        cls_nums_all,
+        MAP,
+        OP,
+        OR,
+        OF1,
+        CP,
+        CR,
+        CF1,
+        IOU_score,
+        IOU_pred,
+        AUC_from_scores,
+        ACC_from_scores,
+        ERR_from_scores,
+    )
 
 
 def main():
@@ -299,9 +345,31 @@ def main():
         )
 
         # Evaluate
-        ACC_cls, cls_acc_all, cls_nums_all, MAP, OP, OR, OF1, CP, CR, CF1, IOU_score, IOU_pred = evaluate_model(test_loader,model,processor,device,option_vectors,vectorizer,options,option_labels)
+        (
+            ACC_cls,
+            cls_acc_all,
+            cls_nums_all,
+            MAP,
+            OP,
+            OR,
+            OF1,
+            CP,
+            CR,
+            CF1,
+            IOU_score,
+            IOU_pred,
+            AUC_cls,
+            ACC_cls_cont,
+            ERR_cls_cont,
+        ) = evaluate_model(test_loader,model,processor,device,option_vectors,vectorizer,options,option_labels)
 
         log_print('#######<--record-->###########')
+        if math.isnan(AUC_cls):
+            log_print("AUC (real/fake, continuous fake score): nan (single-class labels)")
+        else:
+            log_print(f"AUC (real/fake, continuous fake score): {AUC_cls*100:.2f}")
+        log_print(f"ACC (real/fake, threshold=0.5 on fake score): {ACC_cls_cont*100:.2f}")
+        log_print(f"ERR (real/fake, threshold=0.5 on fake score): {ERR_cls_cont*100:.2f}")
         log_print(f"ACC_cls (Accuracy): {ACC_cls*100:.2f} (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
         log_print(f"MAP (Mean Average Precision): {MAP*100:.2f}")
         log_print(f"IoU Score: {IOU_score*100:.2f}")
