@@ -92,6 +92,57 @@ def load_annotation_file(path):
         return values
 
 
+def resolve_image_paths(records, annotation_path, image_root=None):
+    """
+    Resolve relative image paths in-place.
+    Priority:
+      1) user-provided image_root
+      2) auto-detected base directory from annotation_path/cwd
+    """
+    if not isinstance(records, list) or len(records) == 0:
+        return
+
+    rel_paths = []
+    for ann in records:
+        img = ann.get("image", "")
+        if isinstance(img, str) and len(img) > 0 and (not os.path.isabs(img)):
+            rel_paths.append(img)
+
+    if len(rel_paths) == 0:
+        return
+
+    if image_root is not None and len(image_root.strip()) > 0:
+        chosen_base = image_root
+    else:
+        ann_dir = os.path.dirname(os.path.abspath(annotation_path))
+        candidates = [os.getcwd(), ann_dir]
+        cur = ann_dir
+        for _ in range(6):
+            cur = os.path.dirname(cur)
+            if cur not in candidates:
+                candidates.append(cur)
+
+        sample_rel = rel_paths[: min(50, len(rel_paths))]
+        best_score = -1
+        chosen_base = None
+        for base in candidates:
+            score = 0
+            for rel in sample_rel:
+                if os.path.exists(os.path.join(base, rel)):
+                    score += 1
+            if score > best_score:
+                best_score = score
+                chosen_base = base
+
+    if chosen_base is None:
+        return
+
+    for ann in records:
+        img = ann.get("image", "")
+        if isinstance(img, str) and len(img) > 0 and (not os.path.isabs(img)):
+            ann["image"] = os.path.join(chosen_base, img)
+
+
 def get_bbox_loss(output_coord, target_bbox, is_image=None):
     """
     Bounding Box Loss: L1 & GIoU
@@ -390,7 +441,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, disable_bbox_supervision=False, disable_fake_text_pos_supervision=False, classification_only_supervision=False):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, disable_bbox_supervision=False, disable_fake_text_pos_supervision=False, classification_only_supervision=False, image_root=None):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
@@ -465,6 +516,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
     elif dataset_name == 'DGM4':
         train_data = load_annotation_file(train_js)
         val_data = load_annotation_file(val_js)
+        resolve_image_paths(train_data, train_js, image_root=image_root)
+        resolve_image_paths(val_data, val_js, image_root=image_root)
             
         train_dataset = DGM4_Dataset(split='train',data=train_data)
         val_datasets = {"DGM4": DGM4_Dataset(split='validation',data=val_data)}
@@ -706,6 +759,7 @@ def main():
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
+    parser.add_argument("--image-root", type=str, default=None, help="Optional base directory to resolve relative paths in annotation field 'image'.")
     parser.add_argument("--disable-bbox-supervision", action='store_true', help="Disable bbox supervision losses (L1 + GIoU).")
     parser.add_argument("--disable-fake-text-pos-supervision", action='store_true', help="Compatibility flag: fake_text_pos supervision loss is not used in this training script.")
     parser.add_argument("--classification-only-supervision", action='store_true', help="Train version 2: keep only classification-label related supervision (disable bbox and regular losses, and strip localization/text-grounding suffixes from LM labels).")
@@ -721,7 +775,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.disable_bbox_supervision, args.disable_fake_text_pos_supervision, args.classification_only_supervision),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.disable_bbox_supervision, args.disable_fake_text_pos_supervision, args.classification_only_supervision, args.image_root),
         nprocs=world_size,
         join=True
     )
