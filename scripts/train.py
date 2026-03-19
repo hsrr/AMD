@@ -54,6 +54,44 @@ def cleanup():
     dist.destroy_process_group()
 
 
+def load_annotation_file(path):
+    """
+    Load annotations from:
+    1) a standard JSON array/object, or
+    2) concatenated JSON values / JSONL-style files.
+    Returns a list of records.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, list):
+            return parsed
+        return [parsed]
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        idx = 0
+        values = []
+        content_len = len(content)
+
+        while idx < content_len:
+            while idx < content_len and content[idx].isspace():
+                idx += 1
+            if idx >= content_len:
+                break
+            obj, next_idx = decoder.raw_decode(content, idx)
+            if isinstance(obj, list):
+                values.extend(obj)
+            else:
+                values.append(obj)
+            idx = next_idx
+
+        if len(values) == 0:
+            raise ValueError(f"Failed to parse annotation file: {path}")
+        return values
+
+
 def get_bbox_loss(output_coord, target_bbox, is_image=None):
     """
     Bounding Box Loss: L1 & GIoU
@@ -425,10 +463,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             "docvqa": DocVQADataset(split='validation')
         }
     elif dataset_name == 'DGM4':
-        with open(train_js, "r") as f:
-            train_data = json.load(f)
-        with open(val_js, "r") as f:
-            val_data = json.load(f)
+        train_data = load_annotation_file(train_js)
+        val_data = load_annotation_file(val_js)
             
         train_dataset = DGM4_Dataset(split='train',data=train_data)
         val_datasets = {"DGM4": DGM4_Dataset(split='validation',data=val_data)}
