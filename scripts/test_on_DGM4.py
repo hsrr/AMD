@@ -8,15 +8,49 @@ import json
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
-from data import OriDGM4Dataset
+from data import OriDGM4Dataset, DGM4_Dataset
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import numpy as np
 import sys, re
 from multilabel_metrics import AveragePrecisionMeter
 import os,math
 import datetime
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+OPTION_PREFIX_TO_INDEX = {
+    "A.": 0,
+    "B.": 1,
+    "C.": 2,
+    "D.": 3,
+    "E.": 4,
+    "F.": 5,
+}
+
+MULTI_LABEL_TARGETS = torch.tensor(
+    [
+        [0, 0, 0, 0],
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [1, 0, 1, 0],
+        [0, 1, 1, 0],
+    ],
+    dtype=torch.long,
+)
+
+
+def extract_option_index(answer):
+    answer = answer.strip()
+    for prefix, idx in OPTION_PREFIX_TO_INDEX.items():
+        if answer.startswith(prefix):
+            return idx
+
+    match = re.search(r"([A-F])\.", answer)
+    if match:
+        return OPTION_PREFIX_TO_INDEX.get(f"{match.group(1)}.", 0)
+    return 0
 
 
 def get_best_option(generated_texts, option_vectors,vectorizer,options,option_labels,device):
@@ -46,36 +80,12 @@ def get_best_option(generated_texts, option_vectors,vectorizer,options,option_la
     # 是A. No.的地方设置为 0 --代表real图文
     pred_label[real_label_pos] = 0
     
-    return best_options, best_similarities, best_multi_labels,pred_label
+    return best_options, best_similarities, best_multi_labels, pred_label, best_option_indices, similarities
 
 def get_multi_label(answers,device):
-    # 初始化 multi_label 矩阵
-    multi_label = torch.zeros([len(answers), 4], dtype=torch.long).to(device)
-    
-    # 定义 real_label_pos（精确匹配 'A. No.'）
-    real_label_pos = [i for i, ans in enumerate(answers) if 'A. No.' in ans ]
-    multi_label[real_label_pos, :] = torch.tensor([0, 0, 0, 0]).to(device)
-    
-    # face_swap cls = [1, 0, 0, 0]（精确匹配 'B. Only face swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'B. Only face swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 0, 0]).to(device)
-    
-    # face_attribute cls = [0, 1, 0, 0]（精确匹配 'C. Only face attribute.'）
-    pos = [i for i, ans in enumerate(answers) if 'C. Only face attribute.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 0, 0]).to(device)
-    
-    # text_swap cls = [0, 0, 1, 0]（精确匹配 'D. Only text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'D. Only text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 0, 1, 0]).to(device)
-    
-    # face_swap&text_swap cls = [1, 0, 1, 0]（精确匹配 'E. Face swap and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'E. Face swap and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 1, 0]).to(device)
-    
-    # face_attribute&text_swap cls = [0, 1, 1, 0]（精确匹配 'F. Face attribute and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'F. Face attribute and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 1, 0]).to(device)
-    
+    class_indices = [extract_option_index(ans) for ans in answers]
+    multi_label = MULTI_LABEL_TARGETS[class_indices].to(device)
+    real_label_pos = [i for i, idx in enumerate(class_indices) if idx == 0]
     return multi_label, real_label_pos
 
 
@@ -235,7 +245,7 @@ def compute_token_acc(captions, pre_words, fake_text_pos_list,tokenizer):
 
 
 
-def evaluate_model(test_loader, model, processor,device,option_vectors,vectorizer,options,option_labels,tokenizer):
+def evaluate_model(test_loader, model, processor,device,option_vectors,vectorizer,options,option_labels,tokenizer, classification_only=False):
 
     IOU_pred = []
     token_acc_list = []
@@ -244,8 +254,14 @@ def evaluate_model(test_loader, model, processor,device,option_vectors,vectorize
     val_item_count = 0 
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
+    y_true_binary, y_pred_binary, y_fake_scores = [], [], []
+    y_true_multi, y_pred_multi = [], []
 
-    for inputs, batch_answers,fake_text_pos_list,captions,fake_image_box in tqdm(test_loader, desc="Evaluating"):
+    for batch in tqdm(test_loader, desc="Evaluating"):
+        if classification_only:
+            inputs, batch_answers = batch
+        else:
+            inputs, batch_answers,fake_text_pos_list,captions,fake_image_box = batch
         
     
         # generated_texts = run_batch(inputs)
@@ -262,65 +278,102 @@ def evaluate_model(test_loader, model, processor,device,option_vectors,vectorize
                 
         task_answers = []
         pred_words_list = [] # 存储预测的假单词
-        output_coords = torch.zeros((len(generated_texts), 4)).to(device)
-        true_coords = torch.zeros((len(generated_texts), 4)).to(device)
+        if not classification_only:
+            output_coords = torch.zeros((len(generated_texts), 4)).to(device)
+            true_coords = torch.zeros((len(generated_texts), 4)).to(device)
         
         
         for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
 
             full_answer = re.sub(r"<pad>|<s>|</s>", "", generated_text)
             pre_words = [] # 初始化pre_words
-            ## 如果在返回中有Swapped words:，先拿出来备用
-            if 'Swapped words:' in full_answer:
-                pre_words = full_answer.split('Swapped words:')[-1]
-                full_answer = full_answer.split('Swapped words:')[0]
+            if not classification_only:
+                ## 如果在返回中有Swapped words:，先拿出来备用
+                if 'Swapped words:' in full_answer:
+                    pre_words = full_answer.split('Swapped words:')[-1]
+                    full_answer = full_answer.split('Swapped words:')[0]
             
             if '<loc_' in full_answer:
                 task_answers.append(full_answer.split('Manipulated face')[0])
-                output_coords[i] = parse_coordinates(full_answer).to(device)
-                true_coords[i] = parse_coordinates(answers).to(device)
+                if not classification_only:
+                    output_coords[i] = parse_coordinates(full_answer).to(device)
+                    true_coords[i] = parse_coordinates(answers).to(device)
             # 将 output_coord 堆叠到 output_coords中
             else:
                 task_answers.append(full_answer)
-                true_coords[i] = parse_coordinates(answers).to(device)
+                if not classification_only:
+                    true_coords[i] = parse_coordinates(answers).to(device)
             
-            pred_words_list.append(pre_words)
+            if not classification_only:
+                pred_words_list.append(pre_words)
                 
         
                 
         real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
         real_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
         real_label[real_label_pos] = 0
-        best_options, _ ,best_multi_labels,pred_label =  get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
+        best_options, _ ,best_multi_labels,pred_label, best_option_indices, similarities = get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
+
+        true_multi_indices = [extract_option_index(ans) for ans in batch_answers]
+        pred_multi_indices = best_option_indices.tolist()
+        y_true_multi.extend(true_multi_indices)
+        y_pred_multi.extend(pred_multi_indices)
+        batch_true_binary = [0 if idx == 0 else 1 for idx in true_multi_indices]
+        batch_pred_binary = [0 if idx == 0 else 1 for idx in pred_multi_indices]
+        y_true_binary.extend(batch_true_binary)
+        y_pred_binary.extend(batch_pred_binary)
+        y_fake_scores.extend((1.0 - similarities[:, 0]).tolist())
         
         ##--reeal/fake---##
         cls_nums_all = val_item_count
         cls_acc_all += torch.sum(real_label == pred_label).item()
         
-        IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
-
-        # IOU_pred.extend(IOU.cpu().tolist())
-        for iou_value in IOU.cpu().tolist():
-            if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
-                IOU_pred.append(iou_value)
-            else:
-                IOU_pred.append(0.0)
+        if not classification_only:
+            IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
+            for iou_value in IOU.cpu().tolist():
+                if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
+                    IOU_pred.append(iou_value)
+                else:
+                    IOU_pred.append(0.0)
         ######################################3
 
         ##-multi--##
         multi_label_meter.add(best_multi_labels, real_multi_label)
         ## token-acc ##
-        token_acc_list.append(compute_token_acc(captions,pred_words_list,fake_text_pos_list,tokenizer))
+        if not classification_only:
+            token_acc_list.append(compute_token_acc(captions,pred_words_list,fake_text_pos_list,tokenizer))
         
 
-    IOU_score = sum(IOU_pred)/len(IOU_pred)
-    Token_ACC = sum(token_acc_list)/len(token_acc_list)
+    IOU_score = sum(IOU_pred)/len(IOU_pred) if len(IOU_pred) > 0 else float("nan")
+    Token_ACC = sum(token_acc_list)/len(token_acc_list) if len(token_acc_list) > 0 else float("nan")
     ACC_cls = cls_acc_all / cls_nums_all
     
     MAP = multi_label_meter.value()[:3].mean()
-    
+    binary_acc = accuracy_score(y_true_binary, y_pred_binary) if len(y_true_binary) > 0 else float("nan")
+    binary_err = 1.0 - binary_acc if not math.isnan(binary_acc) else float("nan")
+    if len(set(y_true_binary)) > 1:
+        binary_auc = roc_auc_score(y_true_binary, y_fake_scores)
+    else:
+        binary_auc = float("nan")
 
-    return ACC_cls, cls_acc_all, cls_nums_all,IOU_score,MAP,Token_ACC
+    multi_acc = accuracy_score(y_true_multi, y_pred_multi) if len(y_true_multi) > 0 else float("nan")
+    multi_macro_f1 = f1_score(y_true_multi, y_pred_multi, average="macro", zero_division=0) if len(y_true_multi) > 0 else float("nan")
+    multi_weighted_f1 = f1_score(y_true_multi, y_pred_multi, average="weighted", zero_division=0) if len(y_true_multi) > 0 else float("nan")
+
+    return {
+        "ACC_cls": ACC_cls,
+        "cls_acc_all": cls_acc_all,
+        "cls_nums_all": cls_nums_all,
+        "IOU_score": IOU_score,
+        "MAP": MAP,
+        "Token_ACC": Token_ACC,
+        "binary_ACC": binary_acc,
+        "binary_ERR": binary_err,
+        "binary_AUC": binary_auc,
+        "multi_ACC": multi_acc,
+        "multi_macro_F1": multi_macro_f1,
+        "multi_weighted_F1": multi_weighted_f1,
+    }
 
 
 def main():
@@ -331,6 +384,7 @@ def main():
     parser.add_argument("--vals", nargs='+', required=True, help="List of validation JSON file paths")
     parser.add_argument("--output_file", type=str, required=True, help="File to save evaluation logs")
     parser.add_argument("--tokenizer", type=str, default='bert-base-uncased', help="Tokenizer pth")
+    parser.add_argument("--classification-only", action='store_true', help="Classification-only version: do not rely on bbox/fake_text_pos GT.")
     args = parser.parse_args()
 
     # Set device
@@ -372,13 +426,15 @@ def main():
         with open(args.output_file, "a") as flog:
             print(*args_, **kwargs_, file=flog)
     
-    def collate_fn(batch):
-
-        #### DGM4的定义：
+    def collate_fn_ori(batch):
         images, questions, answers, fake_words_lists, captions,fake_image_box = zip(*batch)
-        
         inputs = processor(text=list(questions), images=list(images), return_tensors="pt", padding=True).to(device)
-        return inputs, answers,fake_words_lists,captions,fake_image_box
+        return inputs, answers, fake_words_lists, captions, fake_image_box
+
+    def collate_fn_cls_only(batch):
+        images, questions, answers, fake_image_box = zip(*batch)
+        inputs = processor(text=list(questions), images=list(images), return_tensors="pt", padding=True).to(device)
+        return inputs, answers
 
     log_print(f"test model_id is {args.model_id}")
 
@@ -386,22 +442,45 @@ def main():
         with open(val_js, "r") as f:
             val_data = json.load(f)
 
-        test_dataset = OriDGM4Dataset(split="validation", data=val_data)
+        if args.classification_only:
+            test_dataset = DGM4_Dataset(split="validation", data=val_data)
+            current_collate_fn = collate_fn_cls_only
+        else:
+            test_dataset = OriDGM4Dataset(split="validation", data=val_data)
+            current_collate_fn = collate_fn_ori
         test_loader = DataLoader(
             test_dataset,
             batch_size=args.batch_size,
-            collate_fn=collate_fn,
+            collate_fn=current_collate_fn,
             num_workers=0,
             prefetch_factor=None,
         )
 
-        ACC_cls, cls_acc_all, cls_nums_all, MAP, IOU_score, Token_ACC = evaluate_model(test_loader,model,processor,device,option_vectors,vectorizer,options,option_labels,tokenizer)
+        metrics = evaluate_model(
+            test_loader,
+            model,
+            processor,
+            device,
+            option_vectors,
+            vectorizer,
+            options,
+            option_labels,
+            tokenizer,
+            classification_only=args.classification_only,
+        )
 
         log_print('#######<--record-->###########')
-        log_print(f"ACC_cls (Accuracy): {ACC_cls*100} (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
-        log_print(f"MAP (Mean Average Precision): {MAP*100}")
-        log_print(f"IoUscore: {IOU_score*100}")
-        log_print(f"Token_Acc: {Token_ACC*100}")
+        log_print(f"ACC_cls (Accuracy): {metrics['ACC_cls']*100} (cls_acc_all: {metrics['cls_acc_all']}, cls_nums_all: {metrics['cls_nums_all']})")
+        log_print(f"Binary_ACC: {metrics['binary_ACC']*100}")
+        log_print(f"Binary_ERR: {metrics['binary_ERR']*100}")
+        log_print(f"Binary_AUC: {metrics['binary_AUC']*100 if not math.isnan(metrics['binary_AUC']) else 'nan'}")
+        log_print(f"Multi_ACC: {metrics['multi_ACC']*100}")
+        log_print(f"Multi_macro_F1: {metrics['multi_macro_F1']*100}")
+        log_print(f"Multi_weighted_F1: {metrics['multi_weighted_F1']*100}")
+        if not args.classification_only:
+            log_print(f"MAP (Mean Average Precision): {metrics['MAP']*100}")
+            log_print(f"IoUscore: {metrics['IOU_score']*100}")
+            log_print(f"Token_Acc: {metrics['Token_ACC']*100}")
         log_print('########<--record-->#########')
         log_print("END############################################################################################")
 

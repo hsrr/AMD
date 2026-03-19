@@ -29,6 +29,45 @@ import sys
 from multilabel_metrics import AveragePrecisionMeter
 from torchvision.ops.boxes import box_area
 
+OPTION_TEXTS = [
+    "A. No.",
+    "B. Only face swap.",
+    "C. Only face attribute.",
+    "D. Only text swap.",
+    "E. Face swap and text swap.",
+    "F. Face attribute and text swap.",
+]
+
+OPTION_MATRIX_VALUES = [
+    [0.0, 0.0, 0.0, 0.0],
+    [1.0, -0.33, -0.33, -0.33],
+    [-0.33, 1.0, -0.33, -0.33],
+    [-0.33, -0.33, 1.0, -0.33],
+    [0.5, -0.5, 0.5, -0.5],
+    [-0.5, 0.5, 0.5, -0.5],
+]
+
+OPTION_PREFIX_TO_INDEX = {
+    "A.": 0,
+    "B.": 1,
+    "C.": 2,
+    "D.": 3,
+    "E.": 4,
+    "F.": 5,
+}
+
+MULTI_LABEL_TARGETS = torch.tensor(
+    [
+        [0, 0, 0, 0],
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+        [1, 0, 1, 0],
+        [0, 1, 1, 0],
+    ],
+    dtype=torch.long,
+)
+
 
 
 def set_seed(seed, rank=0):
@@ -160,34 +199,46 @@ def create_data_loaders(
 
     return train_loader, val_loaders
 
+def extract_option_index(answer):
+    answer = answer.strip()
+    for prefix, idx in OPTION_PREFIX_TO_INDEX.items():
+        if answer.startswith(prefix):
+            return idx
+
+    match = re.search(r"([A-F])\.", answer)
+    if match:
+        return OPTION_PREFIX_TO_INDEX.get(f"{match.group(1)}.", 0)
+    return 0
+
+def get_option_class_labels(answers, device):
+    indices = [extract_option_index(ans) for ans in answers]
+    return torch.tensor(indices, dtype=torch.long, device=device)
+
+def get_option_matrix(device):
+    return torch.tensor(OPTION_MATRIX_VALUES, dtype=torch.float, device=device)
+
+def build_multiclass_logits(logits_list, option_matrix):
+    cls_logits = logits_list[:3]
+    if any(logits is None for logits in cls_logits):
+        return None
+
+    # Reuse the three existing binary heads and decode to 6-way class scores via the provided matrix.
+    branch_scores = torch.stack(
+        [logits[:, 0] - logits[:, 1] for logits in cls_logits],
+        dim=1,
+    )
+    zero_column = torch.zeros(
+        (branch_scores.size(0), 1),
+        device=branch_scores.device,
+        dtype=branch_scores.dtype,
+    )
+    branch_scores = torch.cat([branch_scores, zero_column], dim=1)
+    return torch.matmul(branch_scores, option_matrix.t())
+
 def get_multi_label(answers,device):
-    # 初始化 multi_label 矩阵
-    multi_label = torch.zeros([len(answers), 4], dtype=torch.long).to(device)
-    
-    # 定义 real_label_pos（精确匹配 'A. No.'）
-    real_label_pos = [i for i, ans in enumerate(answers) if 'A. No.' in ans ]
-    multi_label[real_label_pos, :] = torch.tensor([0, 0, 0, 0]).to(device)
-    
-    # face_swap cls = [1, 0, 0, 0]（精确匹配 'B. Only face swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'B. Only face swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 0, 0]).to(device)
-    
-    # face_attribute cls = [0, 1, 0, 0]（精确匹配 'C. Only face attribute.'）
-    pos = [i for i, ans in enumerate(answers) if 'C. Only face attribute.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 0, 0]).to(device)
-    
-    # text_swap cls = [0, 0, 1, 0]（精确匹配 'D. Only text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'D. Only text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 0, 1, 0]).to(device)
-    
-    # face_swap&text_swap cls = [1, 0, 1, 0]（精确匹配 'E. Face swap and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'E. Face swap and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 1, 0]).to(device)
-    
-    # face_attribute&text_swap cls = [0, 1, 1, 0]（精确匹配 'F. Face attribute and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'F. Face attribute and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 1, 0]).to(device)
-    
+    class_indices = [extract_option_index(ans) for ans in answers]
+    multi_label = MULTI_LABEL_TARGETS[class_indices].to(device)
+    real_label_pos = [i for i, idx in enumerate(class_indices) if idx == 0]
     return multi_label, real_label_pos
 
 def get_best_option(generated_texts, option_vectors,vectorizer,options,option_labels,device):
@@ -251,7 +302,7 @@ def parse_coordinates(text):
         return torch.tensor([[0, 0, 0, 0]])
 
 
-def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels):
+def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels, classification_only=False):
 
     # Evaluation phase
     model.eval()
@@ -275,8 +326,9 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
                 
                 task_answers = []
-                output_coords = torch.zeros((len(generated_texts), 4)).to(device)
-                true_coords = torch.zeros((len(generated_texts), 4)).to(device)
+                if not classification_only:
+                    output_coords = torch.zeros((len(generated_texts), 4)).to(device)
+                    true_coords = torch.zeros((len(generated_texts), 4)).to(device)
                 
                 for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
 
@@ -284,12 +336,14 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                     
                     if '<loc_' in full_answer:
                         task_answers.append(full_answer.split('Manipulated face')[0])
-                        output_coords[i] = parse_coordinates(full_answer).to(device)
-                        true_coords[i] = parse_coordinates(answers).to(device)
+                        if not classification_only:
+                            output_coords[i] = parse_coordinates(full_answer).to(device)
+                            true_coords[i] = parse_coordinates(answers).to(device)
     
                     else:
                         task_answers.append(full_answer)
-                        true_coords[i] = parse_coordinates(answers).to(device)
+                        if not classification_only:
+                            true_coords[i] = parse_coordinates(answers).to(device)
                 
                 
                 real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
@@ -302,20 +356,20 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 cls_acc_all += torch.sum(real_label == pred_label).item()
                 
                 ##-IoU--##
-                IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
-                
-                for iou_value in IOU.cpu().tolist():
-                    if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
-                        IOU_pred.append(iou_value)
-                    else:
-                        IOU_pred.append(0.0)
+                if not classification_only:
+                    IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
+                    for iou_value in IOU.cpu().tolist():
+                        if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
+                            IOU_pred.append(iou_value)
+                        else:
+                            IOU_pred.append(0.0)
                 ######################################
                             
                 ##-multi--##
                 multi_label_meter.add(best_multi_labels, real_multi_label)
                 
                 local_ACC_cls = cls_acc_all / cls_nums_all
-                local_IOU_score = sum(IOU_pred)/len(IOU_pred)
+                local_IOU_score = sum(IOU_pred)/len(IOU_pred) if len(IOU_pred) > 0 else 0.0
                 local_MAP = multi_label_meter.value()[:3].mean().item()
 
 
@@ -332,18 +386,20 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
         if dist.get_rank() == 0:
             print(f"Rank {rank} - Step {global_step} - ACC perform ({val_name}): {ACC_cls.item()}")
-            wandb.log({
+            wandb_payload = {
                 f"{val_name}_ACC_cls": ACC_cls.item(),
-                f"{val_name}_IoUscore": IoUscore.item(),
                 f"{val_name}_MAP": MAP.item(),
                 "step": global_step
-            })
+            }
+            if not classification_only:
+                wandb_payload[f"{val_name}_IoUscore"] = IoUscore.item()
+            wandb.log(wandb_payload)
             
     model.train()
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, classification_only=False):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
@@ -359,23 +415,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
     if run_name is None:
         run_name = fw.generate(2, separator="_")
 
-    option_labels = [
-    torch.tensor([0, 0, 0, 0]).to(device),
-    torch.tensor([1, -0.33, -0.33, -0.33]).to(device),
-    torch.tensor([-0.33, 1, -0.33, -0.33]).to(device),
-    torch.tensor([-0.33, -0.33, 1, -0.33]).to(device),
-    torch.tensor([0.5, -0.5, 0.5, -0.5]).to(device),
-    torch.tensor([-0.5, 0.5, 0.5, -0.5]).to(device),
-    ]
-    
-    options = [
-    "A. No.",
-    "B. Only face swap.",
-    "C. Only face attribute.",
-    "D. Only text swap.",
-    "E. Face swap and text swap.",
-    "F. Face attribute and text swap.",
-    ]
+    option_matrix = get_option_matrix(device)
+    option_labels = [option_matrix[i] for i in range(option_matrix.size(0))]
+    options = OPTION_TEXTS
     
     vectorizer = TfidfVectorizer().fit(options)
     option_vectors = vectorizer.transform(options).toarray()
@@ -479,10 +521,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         model.train()
         train_loss = 0
         LLM_loss = 0
-        loss_list = []
-        image_loss = 0
-        text_loss = 0
-        LT_loss = 0
+        multiclass_loss = 0
+        loss_bbox = 0
+        loss_giou = 0
         loss_regular = 0
         for batch in tqdm(
             train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}", position=rank
@@ -492,8 +533,10 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             # Prepare the input and target tensors
             input_ids = inputs["input_ids"].to(device)
             pixel_values = inputs["pixel_values"].to(device)
+            answer_supervision = [ans.split('Manipulated face')[0] if classification_only else ans for ans in answers]
+
             labels = processor.tokenizer(
-                text=answers,
+                text=answer_supervision,
                 return_tensors="pt",
                 padding=True,
                 return_token_type_ids=False,
@@ -505,56 +548,38 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                 input_ids=input_ids, pixel_values=pixel_values, labels=labels
             )
             total_loss = outputs.loss
-            Binary_lables = []
-            for tt, label in enumerate(answers):
-                if label.startswith('A'):
-                    Binary_lables.append(1)  
-                else:
-                    Binary_lables.append(0)  
-                    
-            Binary_lables = torch.tensor(Binary_lables, dtype=torch.long).to(device)
-
             logits_list = outputs.classification_logits_list
             ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
-            
+            step_multiclass_loss = torch.tensor(0.0, device=device)
+            step_bbox_loss = torch.tensor(0.0, device=device)
+            step_giou_loss = torch.tensor(0.0, device=device)
+            step_regular_loss = torch.tensor(0.0, device=device)
+
+            class_labels = get_option_class_labels(answer_supervision, device)
+            multiclass_logits = build_multiclass_logits(logits_list, option_matrix)
+            if multiclass_logits is None:
+                raise RuntimeError("❌ classification logits 不完整，无法计算矩阵多分类损失")
+            step_multiclass_loss = criterion(multiclass_logits, class_labels)
+            if torch.isnan(step_multiclass_loss):
+                raise RuntimeError("❌ 多分类损失 step_multiclass_loss = NaN")
+            total_loss += 0.3 * step_multiclass_loss
+
             for i,logits in enumerate(logits_list):
                 if logits is not None:
-                    if i == 0:
-                        temp_loss0 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss0):
-                            raise RuntimeError(f"❌ logits_list[{i}] 产生 NaN，二分类损失 temp_loss0 为 NaN")
-                        total_loss += 0.1*temp_loss0 
-                        loss_list.append(temp_loss0)
-                    if i == 1:
-                        temp_loss1 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss1):
-                            raise RuntimeError(f"❌ logits_list[{i}]  temp_loss1 = NaN")
-                        total_loss += 0.1*temp_loss1 
-                        loss_list.append(temp_loss1)
-                    if i == 2:
-                        temp_loss2 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss2):
-                            raise RuntimeError(f"❌ logits_list[{i}]  temp_loss2 = NaN")
-                        total_loss += 0.1*temp_loss2 
-                        loss_list.append(temp_loss2)
-                        
-                    if i == 3: ##utput_coord
+                    if i == 3 and not classification_only: ## output_coord
                         output_coords = logits.to(device)
                         tensor_fake_image_box = torch.cat(fake_image_box, dim=0).reshape(len(fake_image_box), -1).to(device)
-                        loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box) 
-                        if torch.isnan(loss_bbox):
+                        step_bbox_loss, step_giou_loss = get_bbox_loss(output_coords, tensor_fake_image_box) 
+                        if torch.isnan(step_bbox_loss):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
-                        total_loss += 0.1*(loss_bbox+loss_giou) 
-                        loss_list.append(loss_bbox)
-                        loss_list.append(loss_giou)
+                        total_loss += 0.1*(step_bbox_loss + step_giou_loss)
                     
                     if i == 4: 
-                        loss_regular = logits.to(device)
-                        if torch.isnan(loss_regular):
+                        step_regular_loss = logits.to(device)
+                        if torch.isnan(step_regular_loss):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_regular = NaN")
-                        loss_regular = regular_weight * loss_regular
-                        loss_list.append(loss_regular)
-                        total_loss += loss_regular
+                        step_regular_loss = regular_weight * step_regular_loss
+                        total_loss += step_regular_loss
 
     
             total_loss.backward()
@@ -565,39 +590,34 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
             train_loss += total_loss.item()
             LLM_loss += outputs.loss.item()
-            image_loss += loss_list[0].item()
-            text_loss += loss_list[1].item()
-            LT_loss += loss_list[2].item()
-            loss_bbox += loss_list[3].item()
-            loss_giou += loss_list[4].item()
-            loss_regular += loss_list[5].item()
+            multiclass_loss += step_multiclass_loss.item()
+            if not classification_only:
+                loss_bbox += step_bbox_loss.item()
+                loss_giou += step_giou_loss.item()
+            loss_regular += step_regular_loss.item()
             
             
             
             if rank == 0:
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
-                wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
-                wandb.log({"step": global_step + 1, "step_avg_text_loss": loss_list[1].item()})
-                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": loss_list[2].item()})
-                wandb.log({"step": global_step + 1, "step_avg_bbox_loss": loss_list[3].item()})
-                wandb.log({"step": global_step + 1, "step_avg_giou_loss": loss_list[4].item()})
-                wandb.log({"step": global_step + 1, "step_avg_regular_loss": loss_list[5].item()})
+                wandb.log({"step": global_step + 1, "step_avg_multiclass_loss": step_multiclass_loss.item()})
+                if not classification_only:
+                    wandb.log({"step": global_step + 1, "step_avg_bbox_loss": step_bbox_loss.item()})
+                    wandb.log({"step": global_step + 1, "step_avg_giou_loss": step_giou_loss.item()})
+                wandb.log({"step": global_step + 1, "step_avg_regular_loss": step_regular_loss.item()})
                 
-            loss_list.clear()    
             global_step += 1
 
             if global_step % eval_steps == 0:
-                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels)
+                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels, classification_only=classification_only)
 
-        evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels)
+        evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels, classification_only=classification_only)
 
         # Log training loss to wandb
         avg_train_loss = train_loss / len(train_loader)
         avg_LLM_loss = LLM_loss / len(train_loader)
-        avg_image_loss = image_loss / len(train_loader)
-        avg_text_loss = text_loss / len(train_loader)
-        avg_LT_loss = LT_loss / len(train_loader)
+        avg_multiclass_loss = multiclass_loss / len(train_loader)
         avg_bbox_loss = loss_bbox / len(train_loader)
         avg_giou_loss = loss_giou / len(train_loader)
         avg_regular_loss = loss_regular / len(train_loader)
@@ -606,11 +626,10 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         if rank == 0:
             wandb.log({"epoch": epoch + 1, "epoch_train_loss": avg_train_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_LLM_loss": avg_LLM_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_image_loss": avg_image_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_text_loss": avg_text_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_LearnableToken_loss": avg_LT_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_bbox_loss": avg_bbox_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_giou_loss": avg_giou_loss})
+            wandb.log({"epoch": epoch + 1, "epoch_avg_multiclass_loss": avg_multiclass_loss})
+            if not classification_only:
+                wandb.log({"epoch": epoch + 1, "epoch_avg_bbox_loss": avg_bbox_loss})
+                wandb.log({"epoch": epoch + 1, "epoch_avg_giou_loss": avg_giou_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_regular_loss": avg_regular_loss})
 
 
@@ -646,6 +665,7 @@ def main():
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
+    parser.add_argument("--classification-only", action='store_true', help="Only keep classification-related supervision (disable bbox GT supervision).")
     
     
     
@@ -658,7 +678,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.classification_only),
         nprocs=world_size,
         join=True
     )
