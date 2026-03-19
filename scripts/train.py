@@ -576,6 +576,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         num_training_steps=num_training_steps,
     )
     global_step = 0
+    missing_aux_head_warned = False
 
     for epoch in range(epochs):
         # Training phase
@@ -622,7 +623,20 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                     
             Binary_lables = torch.tensor(Binary_lables, dtype=torch.long).to(device)
 
-            logits_list = outputs.classification_logits_list
+            logits_list = getattr(outputs, "classification_logits_list", None)
+            if logits_list is None:
+                single_logits = getattr(outputs, "classification_logits", None)
+                if single_logits is not None:
+                    logits_list = [single_logits]
+            if logits_list is None:
+                logits_list = []
+                if rank == 0 and (not missing_aux_head_warned):
+                    print(
+                        "⚠️ classification_logits_list is missing in model outputs. "
+                        "Auxiliary classification/bbox/regular losses are skipped; training uses LM loss only. "
+                        "Use an AMD checkpoint to enable auxiliary heads."
+                    )
+                    missing_aux_head_warned = True
             ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
             temp_loss0 = torch.tensor(0.0, device=device)
             temp_loss1 = torch.tensor(0.0, device=device)
