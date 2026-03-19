@@ -43,6 +43,17 @@ face_text_locate = "If there is manipulation of a face, locate the most likely m
 describe_ques_latter_OB = ". The identity and emotion of the face, and the semantic and sentiment of the text should not be manipulated. Question: Is there any fake face or fake words in the news?\nA. No.\nB. Yes.\nThe options is:"
 
 
+def normalize_fake_cls(label):
+    """
+    Normalize legacy/alias manipulation labels to keys used by describles_answ.
+    """
+    if not isinstance(label, str):
+        return label
+    label = label.strip()
+    label = label.replace('text_attribute', 'text_swap')
+    return label
+
+
 
 
 class DGM4_Dataset(Dataset):
@@ -108,7 +119,7 @@ class DGM4_Dataset(Dataset):
     def __getitem__(self, index):
 
         ann = self.data[index]
-        label = ann['fake_cls']
+        label = normalize_fake_cls(ann['fake_cls'])
         
         img_dir = ann['image']
 
