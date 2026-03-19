@@ -190,6 +190,15 @@ def get_multi_label(answers,device):
     
     return multi_label, real_label_pos
 
+
+def get_classification_only_answer(answer):
+    """Keep only class-option text, remove localization/text-grounding suffixes."""
+    clean_answer = answer
+    for marker in ["Manipulated face", "Swapped words:"]:
+        if marker in clean_answer:
+            clean_answer = clean_answer.split(marker)[0]
+    return clean_answer.strip()
+
 def get_best_option(generated_texts, option_vectors,vectorizer,options,option_labels,device):
     '''批量计算模型的输出对应哪一个选项
     输入是生成的多个文本，和固定选项的向量表示
@@ -343,10 +352,15 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, disable_bbox_supervision=False, disable_fake_text_pos_supervision=False):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, disable_bbox_supervision=False, disable_fake_text_pos_supervision=False, classification_only_supervision=False):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
+    # compatibility: when both old disable flags are set, treat as classification-only supervision mode
+    if disable_bbox_supervision and disable_fake_text_pos_supervision:
+        classification_only_supervision = True
+    disable_bbox_loss = disable_bbox_supervision or classification_only_supervision
+    disable_regular_loss = classification_only_supervision
     train_data=[]
     val_data=[]
     
@@ -493,8 +507,12 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             # Prepare the input and target tensors
             input_ids = inputs["input_ids"].to(device)
             pixel_values = inputs["pixel_values"].to(device)
+            if classification_only_supervision:
+                answers_for_lm = [get_classification_only_answer(ans) for ans in answers]
+            else:
+                answers_for_lm = answers
             labels = processor.tokenizer(
-                text=answers,
+                text=answers_for_lm,
                 return_tensors="pt",
                 padding=True,
                 return_token_type_ids=False,
@@ -507,7 +525,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             )
             total_loss = outputs.loss
             Binary_lables = []
-            for tt, label in enumerate(answers):
+            for tt, label in enumerate(answers_for_lm):
                 if label.startswith('A'):
                     Binary_lables.append(1)  
                 else:
@@ -542,7 +560,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                             raise RuntimeError(f"❌ logits_list[{i}]  temp_loss2 = NaN")
                         total_loss += 0.1*temp_loss2
                         
-                    if i == 3 and not disable_bbox_supervision: ##utput_coord
+                    if i == 3 and not disable_bbox_loss: ##utput_coord
                         output_coords = logits.to(device)
                         tensor_fake_image_box = torch.cat(fake_image_box, dim=0).reshape(len(fake_image_box), -1).to(device)
                         step_bbox_loss, step_giou_loss = get_bbox_loss(output_coords, tensor_fake_image_box)
@@ -550,7 +568,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                             raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
                         total_loss += 0.1 * (step_bbox_loss + step_giou_loss)
                     
-                    if i == 4: 
+                    if i == 4 and not disable_regular_loss:
                         step_regular_loss = logits.to(device)
                         if torch.isnan(step_regular_loss):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_regular = NaN")
@@ -569,10 +587,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             image_loss += temp_loss0.item()
             text_loss += temp_loss1.item()
             LT_loss += temp_loss2.item()
-            if not disable_bbox_supervision:
+            if not disable_bbox_loss:
                 loss_bbox += step_bbox_loss.item()
                 loss_giou += step_giou_loss.item()
-            loss_regular += step_regular_loss.item()
+            if not disable_regular_loss:
+                loss_regular += step_regular_loss.item()
             
             
             
@@ -582,10 +601,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                 wandb.log({"step": global_step + 1, "step_avg_image_loss": temp_loss0.item()})
                 wandb.log({"step": global_step + 1, "step_avg_text_loss": temp_loss1.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": temp_loss2.item()})
-                if not disable_bbox_supervision:
+                if not disable_bbox_loss:
                     wandb.log({"step": global_step + 1, "step_avg_bbox_loss": step_bbox_loss.item()})
                     wandb.log({"step": global_step + 1, "step_avg_giou_loss": step_giou_loss.item()})
-                wandb.log({"step": global_step + 1, "step_avg_regular_loss": step_regular_loss.item()})
+                if not disable_regular_loss:
+                    wandb.log({"step": global_step + 1, "step_avg_regular_loss": step_regular_loss.item()})
                 
             global_step += 1
 
@@ -600,9 +620,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         avg_image_loss = image_loss / len(train_loader)
         avg_text_loss = text_loss / len(train_loader)
         avg_LT_loss = LT_loss / len(train_loader)
-        avg_bbox_loss = loss_bbox / len(train_loader) if not disable_bbox_supervision else 0.0
-        avg_giou_loss = loss_giou / len(train_loader) if not disable_bbox_supervision else 0.0
-        avg_regular_loss = loss_regular / len(train_loader)
+        avg_bbox_loss = loss_bbox / len(train_loader) if not disable_bbox_loss else 0.0
+        avg_giou_loss = loss_giou / len(train_loader) if not disable_bbox_loss else 0.0
+        avg_regular_loss = loss_regular / len(train_loader) if not disable_regular_loss else 0.0
     
         
         if rank == 0:
@@ -611,10 +631,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             wandb.log({"epoch": epoch + 1, "epoch_avg_image_loss": avg_image_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_text_loss": avg_text_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_LearnableToken_loss": avg_LT_loss})
-            if not disable_bbox_supervision:
+            if not disable_bbox_loss:
                 wandb.log({"epoch": epoch + 1, "epoch_avg_bbox_loss": avg_bbox_loss})
                 wandb.log({"epoch": epoch + 1, "epoch_avg_giou_loss": avg_giou_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_regular_loss": avg_regular_loss})
+            if not disable_regular_loss:
+                wandb.log({"epoch": epoch + 1, "epoch_avg_regular_loss": avg_regular_loss})
 
 
         # Save model checkpoint
@@ -651,6 +672,7 @@ def main():
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
     parser.add_argument("--disable-bbox-supervision", action='store_true', help="Disable bbox supervision losses (L1 + GIoU).")
     parser.add_argument("--disable-fake-text-pos-supervision", action='store_true', help="Compatibility flag: fake_text_pos supervision loss is not used in this training script.")
+    parser.add_argument("--classification-only-supervision", action='store_true', help="Train version 2: keep only classification-label related supervision (disable bbox and regular losses, and strip localization/text-grounding suffixes from LM labels).")
     
     
     
@@ -663,7 +685,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.disable_bbox_supervision, args.disable_fake_text_pos_supervision),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.disable_bbox_supervision, args.disable_fake_text_pos_supervision, args.classification_only_supervision),
         nprocs=world_size,
         join=True
     )
