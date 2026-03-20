@@ -436,7 +436,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         )
         model = get_peft_model(model, config)
 
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # Create DataLoaders
     num_workers = 0
