@@ -627,7 +627,7 @@ def main():
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
-    parser.add_argument("--image-root", type=str, default='', help="root directory for dataset images, joined with ann['image']")
+    parser.add_argument("--image-root", type=str, default='/data1/yaxiong/dataset', help="root directory for dataset images, joined with ann['image']")
     
     
     
