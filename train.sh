@@ -4,6 +4,7 @@ random_seed=12
 export PYTHONHASHSEED=$random_seed
 export CUDA_VISIBLE_DEVICES=0
 export WANDB_MODE=disabled
+export HF_HOME=/tmp/hf_cache_clean
 
 MODEL_PTH='./models'
 TRAIN_JS='/data1/yaxiong/dataset/DGM4/metadata_split/guardian/train.json'
