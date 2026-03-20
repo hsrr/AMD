@@ -337,11 +337,17 @@ def compute_token_acc(captions, pre_words, fake_text_pos_list,tokenizer):
     TP, TN, FP, FN = 0, 0, 0, 0  # 统计 TP, TN, FP, FN
 
     for caption, pred_fake_words, true_fake_pos in zip(captions, pre_words, fake_text_pos_list):
-        # 1. Tokenize 句子
-        tokenized_caption = tokenizer(caption, return_tensors="pt", padding=True, truncation=True)
-        tokens = tokenizer.tokenize(caption)  # 获取分词后的 token
-        attn_mask = tokenized_caption.attention_mask[:, 1:].squeeze(0)  # 忽略 CLS token
-        token_label = attn_mask.clone()
+        # 1. Tokenize 句子。这里禁用 special tokens，避免 token 序列长度与按词切分映射不一致。
+        tokenized_caption = tokenizer(
+            caption,
+            return_tensors="pt",
+            padding=False,
+            truncation=True,
+            add_special_tokens=False,
+        )
+        attn_mask = tokenized_caption.attention_mask.squeeze(0)
+        token_label = attn_mask.clone().to(torch.long)
+        token_limit = int(token_label.numel())
 
         # 2. 初始化 token 级别标签（真实标签）
         token_label[token_label == 0] = -100  # Padding 部分设为 -100
@@ -354,24 +360,35 @@ def compute_token_acc(captions, pre_words, fake_text_pos_list,tokenizer):
 
         for word_idx, word in enumerate(word_tokens):
             word_tokenized = tokenizer.tokenize(word)  # 该单词的 token 切分
-            word_to_token_map[word_idx] = list(range(token_index, token_index + len(word_tokenized)))
+            start = token_index
+            end = min(token_index + len(word_tokenized), token_limit)
+            if start < token_limit:
+                word_to_token_map[word_idx] = list(range(start, end))
+            else:
+                word_to_token_map[word_idx] = []
             token_index += len(word_tokenized)  # 更新 token 位置索引
         
         # 4. 根据 fake_text_pos_list 设置 token_label
         for word_idx, is_fake in enumerate(true_fake_pos):
             if is_fake == 1 and word_idx in word_to_token_map:
                 for tok_idx in word_to_token_map[word_idx]:
-                    token_label[tok_idx] = 1  # 该单词对应的 token 都标记为假单词
+                    if 0 <= tok_idx < token_limit:
+                        token_label[tok_idx] = 1  # 该单词对应的 token 都标记为假单词
         
         # 5. 处理 pre_words（预测的假单词）
-        pred_fake_words = set(pred_fake_words.split(", ")) if pred_fake_words else set()
+        pred_fake_words = set()
+        if pred_fake_words:
+            pred_fake_words = {
+                w.strip() for w in pred_fake_words.split(",") if isinstance(w, str) and w.strip()
+            }
         pred_token_label = torch.zeros_like(token_label)
 
         for word in pred_fake_words:
             for word_idx, original_word in enumerate(word_tokens):
                 if original_word == word and word_idx in word_to_token_map:
                     for tok_idx in word_to_token_map[word_idx]:
-                        pred_token_label[tok_idx] = 1  # 预测的 token 设为 1（假单词）
+                        if 0 <= tok_idx < token_limit:
+                            pred_token_label[tok_idx] = 1  # 预测的 token 设为 1（假单词）
 
         # 6. 计算 TP, TN, FP, FN
         valid_mask = token_label != -100  # 只计算有效 token
