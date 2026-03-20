@@ -58,6 +58,47 @@ def load_annotation_file(path):
         return values
 
 
+def load_eval_tokenizer(model_id, tokenizer_arg, model_processor):
+    """Load a tokenizer from either a processor repo or a tokenizer repo."""
+    tokenizer_errors = []
+    tokenizer_sources = []
+
+    if tokenizer_arg is not None:
+        tokenizer_arg = str(tokenizer_arg).strip()
+        if tokenizer_arg:
+            tokenizer_sources.append(tokenizer_arg)
+    if model_id not in tokenizer_sources:
+        tokenizer_sources.append(model_id)
+
+    for tokenizer_src in tokenizer_sources:
+        if tokenizer_src == model_id:
+            model_tokenizer = getattr(model_processor, "tokenizer", None)
+            if model_tokenizer is not None:
+                return model_tokenizer
+
+        # Florence-style checkpoints register an AutoProcessor, not an AutoTokenizer.
+        try:
+            tok_processor = AutoProcessor.from_pretrained(tokenizer_src, trust_remote_code=True)
+            tokenizer = getattr(tok_processor, "tokenizer", None)
+            if tokenizer is not None:
+                return tokenizer
+            tokenizer_errors.append(
+                f"AutoProcessor.tokenizer({tokenizer_src}): loaded processor without tokenizer"
+            )
+        except Exception as e:
+            tokenizer_errors.append(f"AutoProcessor.tokenizer({tokenizer_src}): {e}")
+
+        try:
+            return AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
+        except Exception as e:
+            tokenizer_errors.append(f"AutoTokenizer({tokenizer_src}): {e}")
+
+    raise RuntimeError(
+        "Failed to initialize tokenizer. Tried sources: "
+        f"{tokenizer_sources}. Errors: {tokenizer_errors}"
+    )
+
+
 def get_multi_class_index(answers):
     cls_idx = []
     for ans in answers:
@@ -430,33 +471,7 @@ def main():
     # Load model & processors
     model = AutoModelForCausalLM.from_pretrained(args.model_id, trust_remote_code=True).eval().cuda().to(device)
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
-    tokenizer = None
-    tokenizer_errors = []
-    tokenizer_candidates = []
-    if args.tokenizer is not None and len(str(args.tokenizer).strip()) > 0:
-        tokenizer_candidates.append(args.tokenizer)
-    if args.model_id not in tokenizer_candidates:
-        tokenizer_candidates.append(args.model_id)
-
-    for tokenizer_src in tokenizer_candidates:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
-            break
-        except Exception as e:
-            tokenizer_errors.append(f"AutoTokenizer({tokenizer_src}): {e}")
-        try:
-            tok_processor = AutoProcessor.from_pretrained(tokenizer_src, trust_remote_code=True)
-            tokenizer = tok_processor.tokenizer
-            if tokenizer is not None:
-                break
-        except Exception as e:
-            tokenizer_errors.append(f"AutoProcessor.tokenizer({tokenizer_src}): {e}")
-
-    if tokenizer is None:
-        raise RuntimeError(
-            "Failed to initialize tokenizer. Tried sources: "
-            f"{tokenizer_candidates}. Errors: {tokenizer_errors}"
-        )
+    tokenizer = load_eval_tokenizer(args.model_id, args.tokenizer, processor)
 
     # Fixed options & vectorizer
     options = [
