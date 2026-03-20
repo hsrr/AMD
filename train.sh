@@ -2,7 +2,7 @@
 
 random_seed=12 
 export PYTHONHASHSEED=$random_seed
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_MODE=disabled
 
 MODEL_PTH='./models'
