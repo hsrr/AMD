@@ -430,7 +430,33 @@ def main():
     # Load model & processors
     model = AutoModelForCausalLM.from_pretrained(args.model_id, trust_remote_code=True).eval().cuda().to(device)
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    tokenizer = None
+    tokenizer_errors = []
+    tokenizer_candidates = []
+    if args.tokenizer is not None and len(str(args.tokenizer).strip()) > 0:
+        tokenizer_candidates.append(args.tokenizer)
+    if args.model_id not in tokenizer_candidates:
+        tokenizer_candidates.append(args.model_id)
+
+    for tokenizer_src in tokenizer_candidates:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_src, trust_remote_code=True)
+            break
+        except Exception as e:
+            tokenizer_errors.append(f"AutoTokenizer({tokenizer_src}): {e}")
+        try:
+            tok_processor = AutoProcessor.from_pretrained(tokenizer_src, trust_remote_code=True)
+            tokenizer = tok_processor.tokenizer
+            if tokenizer is not None:
+                break
+        except Exception as e:
+            tokenizer_errors.append(f"AutoProcessor.tokenizer({tokenizer_src}): {e}")
+
+    if tokenizer is None:
+        raise RuntimeError(
+            "Failed to initialize tokenizer. Tried sources: "
+            f"{tokenizer_candidates}. Errors: {tokenizer_errors}"
+        )
 
     # Fixed options & vectorizer
     options = [
