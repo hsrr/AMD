@@ -431,8 +431,10 @@ def evaluate_model(test_loader, model, processor,device,option_vectors,vectorize
             max_new_tokens=1024,
             num_beams=3,
         )
-        ###解析得到模型的文本输出
-        generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+        # 仅解码模型新增 token，避免把输入 prompt 回显当成预测结果。
+        input_len = inputs["input_ids"].shape[1]
+        completion_ids = generated_ids[:, input_len:]
+        generated_texts = processor.batch_decode(completion_ids, skip_special_tokens=False)
                 
         task_answers = []
         pred_words_list = [] # 存储预测的假单词
