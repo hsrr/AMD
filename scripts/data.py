@@ -43,6 +43,9 @@ face_text_locate = "If there is manipulation of a face, locate the most likely m
 describe_ques_latter_OB = ". The identity and emotion of the face, and the semantic and sentiment of the text should not be manipulated. Question: Is there any fake face or fake words in the news?\nA. No.\nB. Yes.\nThe options is:"
 
 
+LEGACY_IMAGE_ROOT = '/mnt/da36552c-a636-46f9-9a37-676e692003a2/yuchen/'
+
+
 def normalize_fake_cls(label):
     """
     Normalize legacy/alias manipulation labels to keys used by describles_answ.
@@ -52,6 +55,26 @@ def normalize_fake_cls(label):
     label = label.strip()
     label = label.replace('text_attribute', 'text_swap')
     return label
+
+
+def resolve_image_path(image_path, image_root=None):
+    if not isinstance(image_path, str) or len(image_path) == 0:
+        return image_path
+    if os.path.isabs(image_path):
+        return image_path
+
+    candidates = []
+    if image_root is not None and len(str(image_root).strip()) > 0:
+        candidates.append(os.path.join(image_root, image_path))
+    candidates.append(image_path)
+    candidates.append(os.path.join(LEGACY_IMAGE_ROOT, image_path))
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    # Keep backward-compatible behavior if nothing exists yet.
+    return candidates[0]
 
 
 
@@ -231,13 +254,14 @@ class OriDGM4Dataset(Dataset):
         即包含的answer中有Fake words
     '''
 
-    def __init__(self, split, data, max_words=30, image_res=224):
+    def __init__(self, split, data, max_words=30, image_res=224, image_root=None):
         self.name = "DGM4"
         
         self.data = data
         # self.transform = transform
         self.max_words = max_words
         self.image_res = image_res
+        self.image_root = image_root
 
         is_train = False
         if split == 'train':
@@ -311,9 +335,7 @@ class OriDGM4Dataset(Dataset):
         label = ann['fake_cls'].replace('text_attribute','text_swap')
 
         
-        img_dir = os.path.join('/mnt/da36552c-a636-46f9-9a37-676e692003a2/yuchen/',ann['image'])
-
-        image_dir_all = img_dir
+        image_dir_all = resolve_image_path(ann['image'], image_root=self.image_root)
         
         try:
             image = Image.open(image_dir_all).convert('RGB')
@@ -421,13 +443,14 @@ class APIinferDataset(Dataset):
     '''用于API推理的dataset类
     '''
 
-    def __init__(self, split, data, max_words=30, image_res=224):
+    def __init__(self, split, data, max_words=30, image_res=224, image_root=None):
         self.name = "DGM4"
         
         self.data = data
         # self.transform = transform
         self.max_words = max_words
         self.image_res = image_res
+        self.image_root = image_root
 
         is_train = False
         if split == 'train':
@@ -501,9 +524,7 @@ class APIinferDataset(Dataset):
         label = ann['fake_cls'].replace('text_attribute','text_swap')
 
         
-        img_dir = os.path.join('/mnt/da36552c-a636-46f9-9a37-676e692003a2/yuchen/',ann['image'])
-
-        image_dir_all = img_dir
+        image_dir_all = resolve_image_path(ann['image'], image_root=self.image_root)
         
         try:
             image = Image.open(image_dir_all).convert('RGB')
@@ -645,13 +666,14 @@ class OriDGM4DatasetOB(Dataset):
         即包含的answer中有Fake words
     '''
 
-    def __init__(self, split, data, max_words=30, image_res=224):
+    def __init__(self, split, data, max_words=30, image_res=224, image_root=None):
         self.name = "DGM4"
         
         self.data = data
         # self.transform = transform
         self.max_words = max_words
         self.image_res = image_res
+        self.image_root = image_root
 
         is_train = False
         if split == 'train':
@@ -725,9 +747,7 @@ class OriDGM4DatasetOB(Dataset):
         label = ann['fake_cls'].replace('text_attribute','text_swap')
 
         
-        img_dir = os.path.join('/mnt/da36552c-a636-46f9-9a37-676e692003a2/yuchen/',ann['image'])
-
-        image_dir_all = img_dir
+        image_dir_all = resolve_image_path(ann['image'], image_root=self.image_root)
         
         try:
             image = Image.open(image_dir_all).convert('RGB')

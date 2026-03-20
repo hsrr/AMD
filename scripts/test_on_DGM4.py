@@ -421,6 +421,7 @@ def main():
     parser.add_argument("--vals", nargs='+', required=True, help="List of validation JSON file paths")
     parser.add_argument("--output_file", type=str, required=True, help="File to save evaluation logs")
     parser.add_argument("--tokenizer", type=str, default='bert-base-uncased', help="Tokenizer pth")
+    parser.add_argument("--image-root", type=str, default=None, help="Optional base directory to resolve relative image paths in annotation files.")
     args = parser.parse_args()
 
     # Set device
@@ -475,7 +476,7 @@ def main():
     for val_js in args.vals:
         val_data = load_annotation_file(val_js)
 
-        test_dataset = OriDGM4Dataset(split="validation", data=val_data)
+        test_dataset = OriDGM4Dataset(split="validation", data=val_data, image_root=args.image_root)
         test_loader = DataLoader(
             test_dataset,
             batch_size=args.batch_size,
