@@ -169,34 +169,9 @@ def create_data_loaders(
     return train_loader, val_loaders
 
 def get_multi_label(answers,device):
-    # 初始化 multi_label 矩阵
-    multi_label = torch.zeros([len(answers), 4], dtype=torch.long).to(device)
-    
-    # 定义 real_label_pos（精确匹配 'A. No.'）
-    real_label_pos = [i for i, ans in enumerate(answers) if 'A. No.' in ans ]
-    multi_label[real_label_pos, :] = torch.tensor([0, 0, 0, 0]).to(device)
-    
-    # face_swap cls = [1, 0, 0, 0]（精确匹配 'B. Only face swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'B. Only face swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 0, 0]).to(device)
-    
-    # face_attribute cls = [0, 1, 0, 0]（精确匹配 'C. Only face attribute.'）
-    pos = [i for i, ans in enumerate(answers) if 'C. Only face attribute.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 0, 0]).to(device)
-    
-    # text_swap cls = [0, 0, 1, 0]（精确匹配 'D. Only text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'D. Only text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 0, 1, 0]).to(device)
-    
-    # face_swap&text_swap cls = [1, 0, 1, 0]（精确匹配 'E. Face swap and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'E. Face swap and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 1, 0]).to(device)
-    
-    # face_attribute&text_swap cls = [0, 1, 1, 0]（精确匹配 'F. Face attribute and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'F. Face attribute and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 1, 0]).to(device)
-    
-    return multi_label, real_label_pos
+    # 二分类: real (B. No.) vs fake (A. Yes.)
+    real_label_pos = [i for i, ans in enumerate(answers) if 'B. No.' in ans]
+    return real_label_pos
 
 def get_best_option(generated_texts, option_vectors,vectorizer,options,option_labels,device):
     '''批量计算模型的输出对应哪一个选项
@@ -221,8 +196,8 @@ def get_best_option(generated_texts, option_vectors,vectorizer,options,option_la
     
     #ori_pos，构造模型输出对应的单分类标签
     pred_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
-    real_label_pos = np.where(np.array(best_options) == 'A. No.')[0].tolist()
-    # 是A. No.的地方设置为 0 --代表real图文
+    real_label_pos = np.where(np.array(best_options) == 'B. No.')[0].tolist()
+    # 是B. No.的地方设置为 0 --代表real图文
     pred_label[real_label_pos] = 0
     
     return best_options, best_similarities, best_multi_labels,pred_label
@@ -267,9 +242,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
         for val_name, val_loader in val_loaders.items():
             val_item_count = 0
             cls_nums_all = 0
-            cls_acc_all = 0 
-            multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
-            multi_label_meter.reset()
+            cls_acc_all = 0
             for batch in tqdm(val_loader, desc=f"Evaluation on {val_name} at step {global_step}", position=rank):
                 inputs, batch_answers = batch
                 val_item_count += len(inputs)
@@ -288,7 +261,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                     task_answers.append(full_answer)
                 
                 
-                real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
+                real_label_pos = get_multi_label(batch_answers,device)
                 real_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
                 real_label[real_label_pos] = 0
                 best_options, _ ,best_multi_labels,pred_label = get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
@@ -296,28 +269,21 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 ##--reeal/fake---##
                 cls_nums_all = val_item_count
                 cls_acc_all += torch.sum(real_label == pred_label).item()
-                            
-                ##-multi--##
-                multi_label_meter.add(best_multi_labels, real_multi_label)
                 
                 local_ACC_cls = cls_acc_all / cls_nums_all
-                local_MAP = multi_label_meter.value()[:3].mean().item()
 
 
                 if val_item_count > max_val_item_count:
                     break
         local_ACC_cls_tensor = torch.tensor(local_ACC_cls, device=device)
-        local_MAP_tensor = torch.tensor(local_MAP, device=device)
 
 
         ACC_cls = synchronize_metrics(local_ACC_cls_tensor, world_size)
-        MAP = synchronize_metrics(local_MAP_tensor, world_size)
 
         if dist.get_rank() == 0:
             print(f"Rank {rank} - Step {global_step} - ACC perform ({val_name}): {ACC_cls.item()}")
             wandb.log({
                 f"{val_name}_ACC_cls": ACC_cls.item(),
-                f"{val_name}_MAP": MAP.item(),
                 "step": global_step
             })
             
@@ -342,21 +308,13 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         run_name = fw.generate(2, separator="_")
 
     option_labels = [
-    torch.tensor([0, 0, 0, 0]).to(device),
-    torch.tensor([1, -0.33, -0.33, -0.33]).to(device),
-    torch.tensor([-0.33, 1, -0.33, -0.33]).to(device),
-    torch.tensor([-0.33, -0.33, 1, -0.33]).to(device),
-    torch.tensor([0.5, -0.5, 0.5, -0.5]).to(device),
-    torch.tensor([-0.5, 0.5, 0.5, -0.5]).to(device),
+    torch.tensor([1]).to(device),
+    torch.tensor([0]).to(device),
     ]
     
     options = [
-    "A. No.",
-    "B. Only face swap.",
-    "C. Only face attribute.",
-    "D. Only text swap.",
-    "E. Face swap and text swap.",
-    "F. Face attribute and text swap.",
+    "A. Yes.",
+    "B. No.",
     ]
     
     vectorizer = TfidfVectorizer().fit(options)
@@ -487,7 +445,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             total_loss = outputs.loss
             Binary_lables = []
             for tt, label in enumerate(answers):
-                if label.startswith('A'):
+                if label.startswith('B'):
                     Binary_lables.append(1)  
                 else:
                     Binary_lables.append(0)  
