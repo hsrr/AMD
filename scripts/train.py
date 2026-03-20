@@ -345,7 +345,7 @@ def parse_coordinates(text):
         # print(loc_x1, loc_y1, loc_x2, loc_y2)
         return torch.tensor([[loc_x1, loc_y1, loc_x2, loc_y2]])
     else:
-        print('没有match')
+        # No bbox tag found in text; treat as empty box.
         return torch.tensor([[0, 0, 0, 0]])
 
 
