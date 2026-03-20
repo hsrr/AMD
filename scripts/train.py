@@ -317,7 +317,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, image_root=''):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
@@ -386,12 +386,20 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         }
     elif dataset_name == 'DGM4':
         with open(train_js, "r") as f:
-            train_data = json.load(f)
+            try:
+                train_data = json.load(f)
+            except json.JSONDecodeError:
+                f.seek(0)
+                train_data = [json.loads(line) for line in f if line.strip()]
         with open(val_js, "r") as f:
-            val_data = json.load(f)
+            try:
+                val_data = json.load(f)
+            except json.JSONDecodeError:
+                f.seek(0)
+                val_data = [json.loads(line) for line in f if line.strip()]
             
-        train_dataset = DGM4_Dataset(split='train',data=train_data)
-        val_datasets = {"DGM4": DGM4_Dataset(split='validation',data=val_data)}
+        train_dataset = DGM4_Dataset(split='train', data=train_data, image_root=image_root)
+        val_datasets = {"DGM4": DGM4_Dataset(split='validation', data=val_data, image_root=image_root)}
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -612,6 +620,7 @@ def main():
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
+    parser.add_argument("--image-root", type=str, default='', help="root directory for dataset images, joined with ann['image']")
     
     
     
@@ -624,7 +633,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.image_root),
         nprocs=world_size,
         join=True
     )

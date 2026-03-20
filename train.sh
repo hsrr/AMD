@@ -7,10 +7,11 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 MODEL_PTH='AMD/models'
 TRAIN_JS='path/to/train.json'
 VAL_JS='path/to/val.json'
+IMAGE_ROOT='path/to/dataset/root'
 
 python scripts/train.py \
     --AMD-init-pth "$MODEL_PTH" \
-    --dataset DGM4 \
+    --dataset-type DGM4 \
     --batch-size 5 \
     --epochs 13 \
     --lr 1e-6 \
@@ -20,7 +21,8 @@ python scripts/train.py \
     --regular-weight 2000 \
     --train-js "$TRAIN_JS" \
     --val-js "$VAL_JS" \
-    --train-domain "NYT"\
-    --seed $random_seed
+    --train-domain "NYT" \
+    --seed $random_seed \
+    --image-root "$IMAGE_ROOT"
 
 echo "Training completed at: $(date)"

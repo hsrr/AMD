@@ -49,13 +49,14 @@ class DGM4_Dataset(Dataset):
     '''在我们的类DGM4数据集上的dataset类
     '''
 
-    def __init__(self, split, data, max_words=30, image_res=224):
+    def __init__(self, split, data, max_words=30, image_res=224, image_root=''):
         self.name = "DGM4"
         
         self.data = data
         # self.transform = transform
         self.max_words = max_words
         self.image_res = image_res
+        self.image_root = image_root
 
         is_train = False
         if split == 'train':
@@ -73,12 +74,10 @@ class DGM4_Dataset(Dataset):
         ann = self.data[index]
         label = ann['fake_cls']
         
-        img_dir = ann['image']
-
-        image_dir_all = img_dir
+        image_path = os.path.join(self.image_root, ann['image'])
         
         try:
-            image = Image.open(image_dir_all).convert('RGB')
+            image = Image.open(image_path).convert('RGB')
         except Warning:
             raise ValueError("### Warning: fakenews_dataset Image.open")
 
