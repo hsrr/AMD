@@ -88,7 +88,7 @@ class DGM4_Dataset(Dataset):
 
         caption = pre_caption(ann['text'], self.max_words)
         
-        question = '<DGM4>'+describe_temple + caption + describe_ques_latter + "\nThe answer is:"
+        question = '<DGM4>'+describe_temple + caption + describe_ques_latter
         answer = describles_answ[label]
         
         return image, question, answer
