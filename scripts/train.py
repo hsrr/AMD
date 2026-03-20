@@ -343,7 +343,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12, bbox_weight=0.1):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
@@ -544,7 +544,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                         loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box) 
                         if torch.isnan(loss_bbox):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
-                        total_loss += 0.1*(loss_bbox+loss_giou) 
+                        total_loss += bbox_weight*(loss_bbox+loss_giou) 
                         loss_list.append(loss_bbox)
                         loss_list.append(loss_giou)
                     
@@ -642,6 +642,7 @@ def main():
     parser.add_argument("--run-name", type=str, default='test', help="Run name for wandb")
     parser.add_argument("--max-val-item-count", type=int, default=2000, help="Maximum number of items to evaluate on during validation")
     parser.add_argument("--regular-weight", type=int, default=2000, help="loss weight of L_TRP")
+    parser.add_argument("--bbox-weight", type=float, default=0.1, help="loss weight of bbox (loss_bbox+loss_giou), set to 0.0 to disable forgery localization")
     parser.add_argument("--train-js", type=str, default='./train.json', help="json file for train")
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
@@ -658,7 +659,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.bbox_weight),
         nprocs=world_size,
         join=True
     )
