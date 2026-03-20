@@ -544,7 +544,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                         loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box) 
                         if torch.isnan(loss_bbox):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
-                        total_loss += 0.1*(loss_bbox+loss_giou) 
+                        total_loss += 0.0*(loss_bbox+loss_giou) 
                         loss_list.append(loss_bbox)
                         loss_list.append(loss_giou)
                     
