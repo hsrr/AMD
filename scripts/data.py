@@ -68,43 +68,6 @@ class DGM4_Dataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def get_bbox(self, bbox):
-        xmin, ymin, xmax, ymax = bbox
-        w = xmax - xmin
-        h = ymax - ymin
-        return int(xmin), int(ymin), int(w), int(h)
-    
-    def denormalize_fake_image_box_xyxy(self, fake_image_box, image_width, image_height):
-        """
-        Converts a normalized fake_image_box in [center_x, center_y, w, h] format 
-        to absolute xyxy coordinates with two decimal precision.
-        
-        Args:
-            fake_image_box (torch.Tensor): Tensor containing normalized [center_x, center_y, w, h].
-            image_width (int): The width of the original image.
-            image_height (int): The height of the original image.
-        
-        Returns:
-            tuple: (x1, y1, x2, y2) in absolute coordinates, rounded to two decimal places.
-        """
-        # Unpack the normalized coordinates
-        center_x, center_y, w, h = fake_image_box
-
-        # Convert normalized coordinates to absolute values
-        abs_center_x = center_x * image_width
-        abs_center_y = center_y * image_height
-        abs_w = w * image_width
-        abs_h = h * image_height
-
-        # Calculate xyxy format
-        x1 = abs_center_x - abs_w / 2
-        y1 = abs_center_y - abs_h / 2
-        x2 = abs_center_x + abs_w / 2
-        y2 = abs_center_y + abs_h / 2
-
-        # Round to two decimal places and return as a tuple
-        return round(float(x1), 2), round(float(y1), 2), round(float(x2), 2), round(float(y2), 2)
-
     def __getitem__(self, index):
 
         ann = self.data[index]
@@ -119,98 +82,17 @@ class DGM4_Dataset(Dataset):
         except Warning:
             raise ValueError("### Warning: fakenews_dataset Image.open")
 
-        W, H = image.size
-        has_bbox = False
-        mask = np.zeros((self.image_res,self.image_res,1))
-        
-        if any(keyword in label for keyword in ['face_swap', 'face_attribute']):
-            try:
-                x, y, w, h = self.get_bbox(ann['fake_image_box'])
-                has_bbox = True
-            except Exception:
-                fake_image_box = torch.tensor([0, 0, 0, 0], dtype=torch.float)
-        else:
-            fake_image_box = torch.tensor([0, 0, 0, 0], dtype=torch.float)
-            
-                
-
-        do_hflip = False
         if self.is_train:
             if rand() < 0.5:
-                # flipped applied
                 image = hflip(image)
-                do_hflip = True
-
             image = resize(image, [self.image_res, self.image_res], interpolation=Image.BICUBIC)
-        # image = self.transform(image)
-
-        if has_bbox:
-            # flipped applied
-            if do_hflip:
-                x = (W - x) - w  # W is w0
-
-            # resize applied
-            x = self.image_res / W * x
-            w = self.image_res / W * w
-            y = self.image_res / H * y
-            h = self.image_res / H * h
-
-            mask_x = math.floor(x)
-            mask_y = math.floor(y)
-            mask_w = math.ceil(w)
-            mask_h = math.ceil(h)
-            
-            mask[mask_y:mask_y + mask_h, mask_x:mask_x + mask_w, :] = 1
-
-            center_x = x + 1 / 2 * w
-            center_y = y + 1 / 2 * h
-
-            fake_image_box = torch.tensor([center_x / self.image_res,
-                                           center_y / self.image_res,
-                                           w / self.image_res,
-                                           h / self.image_res],
-                                          dtype=torch.float)
-
 
         caption = pre_caption(ann['text'], self.max_words)
-        # 原始代码
-        # fake_text_pos = ann['fake_text_pos']
-        # 修改后 如果获取不到fake_text_pos，则fake_text_pos的值为[]，
-        fake_text_pos = ann.get('fake_text_pos', [])
-
-
-        fake_text_pos_list = torch.zeros(self.max_words)
-        mask = torch.tensor(mask[None, ..., 0]).float()
-
-        for i in fake_text_pos:
-            if i < self.max_words:
-                fake_text_pos_list[i] = 1
-
-
-        # conversation = []
-        # conversation.append(
-        #     {"from": "human", "value": describe_temple + caption + describe_ques_latter})
-        # conversation.append({"from": "gpt", "value": describles_answ[label]})
         
-        question = '<DGM4>'+describe_temple + caption + describe_ques_latter + face_locate
+        question = '<DGM4>'+describe_temple + caption + describe_ques_latter + "\nThe answer is:"
         answer = describles_answ[label]
         
-        if has_bbox:
-            ## florence2返回的坐标是xyxy格式的 x1,y1,x2,y2 = 365.4,465.2,765.8,999.6
-            x1,y1,x2,y2 = self.denormalize_fake_image_box_xyxy(fake_image_box,W,H)
-            # 保留两位小数，并插入到字符串模板中
-            face_bbox_answer = (
-                "Manipulated face"
-                + f"<loc_{int(x1)}>"
-                + f"<loc_{int(y1)}>"
-                + f"<loc_{int(x2)}>"
-                + f"<loc_{int(y2)}>"
-            )
-            answer += face_bbox_answer
-        # conversation = '<DGM4>'+conversation
-        # mask是根据边界框生成一个与目标分辨率 (self.image_res) 相同大小的掩码（mask），对应的区域被赋值为 1，其余为 0。
-        # return image, question, answer,label, caption, fake_image_box, fake_text_pos_list, W, H, mask
-        return image, question, answer,fake_image_box
+        return image, question, answer
 
 ###########################
 

@@ -118,10 +118,10 @@ def box_iou(boxes1, boxes2, test=False):
 def collate_fn(batch, processor, device):
 
     #### DGM4的定义：
-    images, questions, answers,fake_image_box = zip(*batch)
+    images, questions, answers = zip(*batch)
     
     inputs = processor(text=list(questions), images=list(images), return_tensors="pt", padding=True).to(device)
-    return inputs, answers,fake_image_box
+    return inputs, answers
 
 
 def create_data_loaders(
@@ -260,11 +260,10 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
             val_item_count = 0
             cls_nums_all = 0
             cls_acc_all = 0 
-            IOU_pred = []
             multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
             multi_label_meter.reset()
             for batch in tqdm(val_loader, desc=f"Evaluation on {val_name} at step {global_step}", position=rank):
-                inputs, batch_answers, fake_image_box = batch
+                inputs, batch_answers = batch
                 val_item_count += len(inputs)
                 generated_ids = model.module.generate(
                     input_ids=inputs["input_ids"],
@@ -275,21 +274,10 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
                 
                 task_answers = []
-                output_coords = torch.zeros((len(generated_texts), 4)).to(device)
-                true_coords = torch.zeros((len(generated_texts), 4)).to(device)
                 
                 for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
-
                     full_answer = re.sub(r"<pad>|<s>|</s>", "", generated_text)
-                    
-                    if '<loc_' in full_answer:
-                        task_answers.append(full_answer.split('Manipulated face')[0])
-                        output_coords[i] = parse_coordinates(full_answer).to(device)
-                        true_coords[i] = parse_coordinates(answers).to(device)
-    
-                    else:
-                        task_answers.append(full_answer)
-                        true_coords[i] = parse_coordinates(answers).to(device)
+                    task_answers.append(full_answer)
                 
                 
                 real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
@@ -300,41 +288,27 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 ##--reeal/fake---##
                 cls_nums_all = val_item_count
                 cls_acc_all += torch.sum(real_label == pred_label).item()
-                
-                ##-IoU--##
-                IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
-                
-                for iou_value in IOU.cpu().tolist():
-                    if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
-                        IOU_pred.append(iou_value)
-                    else:
-                        IOU_pred.append(0.0)
-                ######################################
                             
                 ##-multi--##
                 multi_label_meter.add(best_multi_labels, real_multi_label)
                 
                 local_ACC_cls = cls_acc_all / cls_nums_all
-                local_IOU_score = sum(IOU_pred)/len(IOU_pred)
                 local_MAP = multi_label_meter.value()[:3].mean().item()
 
 
                 if val_item_count > max_val_item_count:
                     break
         local_ACC_cls_tensor = torch.tensor(local_ACC_cls, device=device)
-        local_IoU_score_tensor = torch.tensor(local_IOU_score, device=device)
         local_MAP_tensor = torch.tensor(local_MAP, device=device)
 
 
         ACC_cls = synchronize_metrics(local_ACC_cls_tensor, world_size)
-        IoUscore = synchronize_metrics(local_IoU_score_tensor, world_size)
         MAP = synchronize_metrics(local_MAP_tensor, world_size)
 
         if dist.get_rank() == 0:
             print(f"Rank {rank} - Step {global_step} - ACC perform ({val_name}): {ACC_cls.item()}")
             wandb.log({
                 f"{val_name}_ACC_cls": ACC_cls.item(),
-                f"{val_name}_IoUscore": IoUscore.item(),
                 f"{val_name}_MAP": MAP.item(),
                 "step": global_step
             })
@@ -487,7 +461,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         for batch in tqdm(
             train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}", position=rank
         ):
-            inputs, answers,fake_image_box = batch
+            inputs, answers = batch
 
             # Prepare the input and target tensors
             input_ids = inputs["input_ids"].to(device)
