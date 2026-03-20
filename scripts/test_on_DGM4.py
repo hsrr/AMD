@@ -1,5 +1,6 @@
 import logging
 import argparse
+import inspect
 import random
 import torch
 import torch.nn.functional as F
@@ -97,6 +98,23 @@ def load_eval_tokenizer(model_id, tokenizer_arg, model_processor):
         "Failed to initialize tokenizer. Tried sources: "
         f"{tokenizer_sources}. Errors: {tokenizer_errors}"
     )
+
+
+def build_ori_dgm4_dataset(split, data, image_root=None):
+    dataset_kwargs = {"split": split, "data": data}
+    image_root = None if image_root is None else str(image_root).strip()
+    dataset_params = inspect.signature(OriDGM4Dataset.__init__).parameters
+
+    if image_root:
+        if "image_root" in dataset_params:
+            dataset_kwargs["image_root"] = image_root
+        else:
+            raise RuntimeError(
+                "This checkout's OriDGM4Dataset does not accept --image-root. "
+                "Update scripts/data.py or omit --image-root."
+            )
+
+    return OriDGM4Dataset(**dataset_kwargs)
 
 
 def get_multi_class_index(answers):
@@ -517,7 +535,11 @@ def main():
     for val_js in args.vals:
         val_data = load_annotation_file(val_js)
 
-        test_dataset = OriDGM4Dataset(split="validation", data=val_data, image_root=args.image_root)
+        test_dataset = build_ori_dgm4_dataset(
+            split="validation",
+            data=val_data,
+            image_root=args.image_root,
+        )
         test_loader = DataLoader(
             test_dataset,
             batch_size=args.batch_size,
