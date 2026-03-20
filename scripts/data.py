@@ -28,17 +28,17 @@ from DatasetUtils import pre_caption
 describles_answ = {}
 
 describe_temple = "The following are multiple choice questions about fake news detection. \n\nThe caption of news is: "
-describe_ques_latter = ". The identity and emotion of the face, and the semantic and sentiment of the text should not be manipulated. Question: Is there any fake face or fake words in the news?\nA. Yes.\nB. No.\nThe options is:"
+describe_ques_latter = ". The identity and emotion of the face, and the semantic and sentiment of the text should not be manipulated. Question: Is there any face swap/attribute or text swap/attribute in the news?\nA. No.\nB. Only face swap.\nC. Only face attribute.\nD. Only text swap.\nE. Only text attribute.\nF. Face swap and text swap.\nG. Face swap and text attribute.\nH. Face attribute and text swap.\nI. Face attribute and text attribute.\nThe options is:"
 
-describles_answ['orig'] = "B. No."
-describles_answ['face_swap'] = "A. Yes."
-describles_answ['face_attribute'] = "A. Yes."
-describles_answ['text_swap'] = "A. Yes."
-describles_answ['text_attribute'] = "A. Yes."
-describles_answ['face_swap&text_swap'] = "A. Yes."
-describles_answ['face_swap&text_attribute'] = "A. Yes."
-describles_answ['face_attribute&text_swap'] = "A. Yes."
-describles_answ['face_attribute&text_attribute'] = "A. Yes."
+describles_answ['orig'] = "A. No."
+describles_answ['face_swap'] = "B. Only face swap."
+describles_answ['face_attribute'] = "C. Only face attribute."
+describles_answ['text_swap'] = "D. Only text swap."
+describles_answ['text_attribute'] = "E. Only text attribute."
+describles_answ['face_swap&text_swap'] = "F. Face swap and text swap."
+describles_answ['face_swap&text_attribute'] = "G. Face swap and text attribute."
+describles_answ['face_attribute&text_swap'] = "H. Face attribute and text swap."
+describles_answ['face_attribute&text_attribute'] = "I. Face attribute and text attribute."
 
 face_locate = "If there is manipulation of a face, locate the most likely manipulated face in the image and append the results to your selected option.\nThe answer is:"
 face_text_locate = "If there is manipulation of a face, locate the most likely manipulated face in the image and append the results to your selected option. If there is text_swap, list all swapped words in the caption.\nThe answer is:"
