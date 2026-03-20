@@ -553,6 +553,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             
             
             if rank == 0:
+                if (global_step + 1) % 100 == 0:
+                    print(f"  [Step {global_step+1}] "
+                          f"total={total_loss.item():.4f} LLM={outputs.loss.item():.4f} "
+                          f"img={loss_list[0].item():.4f} txt={loss_list[1].item():.4f} "
+                          f"LT={loss_list[2].item():.4f} reg={loss_list[3].item():.4f}")
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
@@ -578,6 +583,10 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
     
         
         if rank == 0:
+            print(f"[Epoch {epoch+1}/{epochs}] "
+                  f"total_loss={avg_train_loss:.4f} LLM={avg_LLM_loss:.4f} "
+                  f"image_cls={avg_image_loss:.4f} text_cls={avg_text_loss:.4f} "
+                  f"LT_cls={avg_LT_loss:.4f} regular={avg_regular_loss:.4f}")
             wandb.log({"epoch": epoch + 1, "epoch_train_loss": avg_train_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_LLM_loss": avg_LLM_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_image_loss": avg_image_loss})
