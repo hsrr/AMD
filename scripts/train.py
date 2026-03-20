@@ -31,6 +31,14 @@ from torchvision.ops.boxes import box_area
 
 
 
+def load_json_or_jsonl(filepath):
+    with open(filepath, "r") as f:
+        content = f.read().strip()
+    if content.startswith('['):
+        return json.loads(content)
+    return [json.loads(line) for line in content.splitlines() if line.strip()]
+
+
 def set_seed(seed, rank=0):
 
     seed = seed + rank  
@@ -385,18 +393,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             "docvqa": DocVQADataset(split='validation')
         }
     elif dataset_name == 'DGM4':
-        with open(train_js, "r") as f:
-            try:
-                train_data = json.load(f)
-            except json.JSONDecodeError:
-                f.seek(0)
-                train_data = [json.loads(line) for line in f if line.strip()]
-        with open(val_js, "r") as f:
-            try:
-                val_data = json.load(f)
-            except json.JSONDecodeError:
-                f.seek(0)
-                val_data = [json.loads(line) for line in f if line.strip()]
+        train_data = load_json_or_jsonl(train_js)
+        val_data = load_json_or_jsonl(val_js)
             
         train_dataset = DGM4_Dataset(split='train', data=train_data, image_root=image_root)
         val_datasets = {"DGM4": DGM4_Dataset(split='validation', data=val_data, image_root=image_root)}
