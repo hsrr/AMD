@@ -15,6 +15,7 @@ from tqdm import tqdm
 from transformers import (AdamW, AutoModelForCausalLM, AutoProcessor,
                           get_scheduler)
 import torch.nn.functional as F
+import box_ops
 import math
 
 import random
@@ -26,6 +27,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import sys
 from multilabel_metrics import AveragePrecisionMeter
+from torchvision.ops.boxes import box_area
 
 
 
@@ -51,6 +53,67 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
+
+def get_bbox_loss(output_coord, target_bbox, is_image=None):
+    """
+    Bounding Box Loss: L1 & GIoU
+
+    Args:
+        image_embeds: encoding full images
+    """
+    loss_bbox = F.l1_loss(output_coord, target_bbox, reduction='none')  # bsz, 4
+
+    boxes1 = box_ops.box_cxcywh_to_xyxy(output_coord)
+    boxes2 = box_ops.box_cxcywh_to_xyxy(target_bbox)
+    if (boxes1[:, 2:] < boxes1[:, :2]).any() or (boxes2[:, 2:] < boxes2[:, :2]).any():
+        # early check of degenerated boxes
+        # print("### (boxes1[:, 2:] < boxes1[:, :2]).any() or (boxes2[:, 2:] < boxes2[:, :2]).any()")
+        loss_giou = torch.zeros(output_coord.size(0), device=output_coord.device)
+    else:
+        # loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(boxes1, boxes2))  # bsz
+        loss_giou = 1 - box_ops.generalized_box_iou(boxes1, boxes2)  # bsz
+
+    if is_image is None:
+        num_boxes = target_bbox.size(0)
+    else:
+        num_boxes = torch.sum(1 - is_image)
+        loss_bbox = loss_bbox * (1 - is_image.view(-1, 1))
+        loss_giou = loss_giou * (1 - is_image)
+
+    return loss_bbox.sum() / num_boxes, loss_giou.sum() / num_boxes
+
+
+def box_iou(boxes1, boxes2, test=False):
+    '''
+    计算两个边界框集合的 IoU（Intersection over Union），
+    并返回每个边界框对的 IoU 值和并集面积。
+    '''
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    # lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    # rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+    lt = torch.max(boxes1[:, :2], boxes2[:, :2])  # [N,2]
+    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])  # [N,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,2]
+    # inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+    inter = wh[:, 0] * wh[:, 1]  # [N]
+
+    # union = area1[:, None] + area2 - inter
+    union = area1 + area2 - inter
+
+    iou = inter / union
+
+    if test:
+        zero_lines = boxes2==torch.zeros_like(boxes2)
+        zero_lines_idx = torch.where(zero_lines[:,0]==True)[0]
+
+        for idx in zero_lines_idx:
+            if all(boxes1[idx,:] < 1e-4):
+                iou[idx]=1
+
+    return iou, union
 
 def collate_fn(batch, processor, device):
 
@@ -168,6 +231,26 @@ def synchronize_metrics(metric_tensor, world_size):
     return metric_tensor
 
 
+def parse_coordinates(text):
+    # 使用正则表达式匹配坐标
+    pattern = r"<loc_(\d+)><loc_(\d+)><loc_(\d+)><loc_(\d+)>"
+    match = re.search(pattern, text)
+    # print(f'input text is {text}')
+    
+    if match:
+        # 将匹配到的坐标转换为整数
+        loc_x1 = int(match.group(1))
+        loc_y1 = int(match.group(2))
+        loc_x2 = int(match.group(3))
+        loc_y2 = int(match.group(4))
+        # print('解析到的坐标是：')
+        # print(loc_x1, loc_y1, loc_x2, loc_y2)
+        return torch.tensor([[loc_x1, loc_y1, loc_x2, loc_y2]])
+    else:
+        print('没有match')
+        return torch.tensor([[0, 0, 0, 0]])
+
+
 def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels):
 
     # Evaluation phase
@@ -177,6 +260,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
             val_item_count = 0
             cls_nums_all = 0
             cls_acc_all = 0 
+            IOU_pred = []
             multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
             multi_label_meter.reset()
             for batch in tqdm(val_loader, desc=f"Evaluation on {val_name} at step {global_step}", position=rank):
@@ -191,6 +275,8 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
                 
                 task_answers = []
+                output_coords = torch.zeros((len(generated_texts), 4)).to(device)
+                true_coords = torch.zeros((len(generated_texts), 4)).to(device)
                 
                 for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
 
@@ -198,8 +284,12 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                     
                     if '<loc_' in full_answer:
                         task_answers.append(full_answer.split('Manipulated face')[0])
+                        output_coords[i] = parse_coordinates(full_answer).to(device)
+                        true_coords[i] = parse_coordinates(answers).to(device)
+    
                     else:
                         task_answers.append(full_answer)
+                        true_coords[i] = parse_coordinates(answers).to(device)
                 
                 
                 real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
@@ -210,27 +300,41 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 ##--reeal/fake---##
                 cls_nums_all = val_item_count
                 cls_acc_all += torch.sum(real_label == pred_label).item()
+                
+                ##-IoU--##
+                IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
+                
+                for iou_value in IOU.cpu().tolist():
+                    if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
+                        IOU_pred.append(iou_value)
+                    else:
+                        IOU_pred.append(0.0)
+                ######################################
                             
                 ##-multi--##
                 multi_label_meter.add(best_multi_labels, real_multi_label)
                 
                 local_ACC_cls = cls_acc_all / cls_nums_all
+                local_IOU_score = sum(IOU_pred)/len(IOU_pred)
                 local_MAP = multi_label_meter.value()[:3].mean().item()
 
 
                 if val_item_count > max_val_item_count:
                     break
         local_ACC_cls_tensor = torch.tensor(local_ACC_cls, device=device)
+        local_IoU_score_tensor = torch.tensor(local_IOU_score, device=device)
         local_MAP_tensor = torch.tensor(local_MAP, device=device)
 
 
         ACC_cls = synchronize_metrics(local_ACC_cls_tensor, world_size)
+        IoUscore = synchronize_metrics(local_IoU_score_tensor, world_size)
         MAP = synchronize_metrics(local_MAP_tensor, world_size)
 
         if dist.get_rank() == 0:
             print(f"Rank {rank} - Step {global_step} - ACC perform ({val_name}): {ACC_cls.item()}")
             wandb.log({
                 f"{val_name}_ACC_cls": ACC_cls.item(),
+                f"{val_name}_IoUscore": IoUscore.item(),
                 f"{val_name}_MAP": MAP.item(),
                 "step": global_step
             })
@@ -411,7 +515,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             Binary_lables = torch.tensor(Binary_lables, dtype=torch.long).to(device)
 
             logits_list = outputs.classification_logits_list
-            ### logits = [image_classification, text_classification,learnable_token_logits,loss_regular]
+            ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
             
             for i,logits in enumerate(logits_list):
                 if logits is not None:
@@ -434,7 +538,17 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                         total_loss += 0.1*temp_loss2 
                         loss_list.append(temp_loss2)
                         
-                    if i == 3: 
+                    if i == 3: ##utput_coord
+                        output_coords = logits.to(device)
+                        tensor_fake_image_box = torch.cat(fake_image_box, dim=0).reshape(len(fake_image_box), -1).to(device)
+                        loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box) 
+                        if torch.isnan(loss_bbox):
+                            raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
+                        total_loss += 0.1*(loss_bbox+loss_giou) 
+                        loss_list.append(loss_bbox)
+                        loss_list.append(loss_giou)
+                    
+                    if i == 4: 
                         loss_regular = logits.to(device)
                         if torch.isnan(loss_regular):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_regular = NaN")
@@ -454,7 +568,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             image_loss += loss_list[0].item()
             text_loss += loss_list[1].item()
             LT_loss += loss_list[2].item()
-            loss_regular += loss_list[3].item()
+            loss_bbox += loss_list[3].item()
+            loss_giou += loss_list[4].item()
+            loss_regular += loss_list[5].item()
             
             
             
@@ -464,7 +580,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                 wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
                 wandb.log({"step": global_step + 1, "step_avg_text_loss": loss_list[1].item()})
                 wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": loss_list[2].item()})
-                wandb.log({"step": global_step + 1, "step_avg_regular_loss": loss_list[3].item()})
+                wandb.log({"step": global_step + 1, "step_avg_bbox_loss": loss_list[3].item()})
+                wandb.log({"step": global_step + 1, "step_avg_giou_loss": loss_list[4].item()})
+                wandb.log({"step": global_step + 1, "step_avg_regular_loss": loss_list[5].item()})
                 
             loss_list.clear()    
             global_step += 1
@@ -480,6 +598,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         avg_image_loss = image_loss / len(train_loader)
         avg_text_loss = text_loss / len(train_loader)
         avg_LT_loss = LT_loss / len(train_loader)
+        avg_bbox_loss = loss_bbox / len(train_loader)
+        avg_giou_loss = loss_giou / len(train_loader)
         avg_regular_loss = loss_regular / len(train_loader)
     
         
@@ -489,6 +609,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             wandb.log({"epoch": epoch + 1, "epoch_avg_image_loss": avg_image_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_text_loss": avg_text_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_LearnableToken_loss": avg_LT_loss})
+            wandb.log({"epoch": epoch + 1, "epoch_avg_bbox_loss": avg_bbox_loss})
+            wandb.log({"epoch": epoch + 1, "epoch_avg_giou_loss": avg_giou_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_regular_loss": avg_regular_loss})
 
 

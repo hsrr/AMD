@@ -2014,6 +2014,50 @@ class Florence2Decoder(Florence2LanguagePreTrainedModel):
             cross_attentions=all_cross_attentions,
         )
 
+class Bbox_Verification(nn.Module):
+    def __init__(self, embeding):
+        super().__init__()
+        self.norm_layer_aggr = nn.LayerNorm(embeding)
+        self.aggregator = nn.MultiheadAttention(embeding, 16, dropout=0.0, batch_first=True)
+
+        self.bbox_head = self.build_mlp(input_dim=embeding, output_dim=4)
+        
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def build_mlp(self, input_dim, output_dim):
+        return nn.Sequential(
+            nn.Linear(input_dim, input_dim * 2),
+            nn.LayerNorm(input_dim * 2),
+            nn.GELU(),
+            nn.Linear(input_dim* 2, input_dim * 2),
+            nn.LayerNorm(input_dim * 2),
+            nn.GELU(),
+            nn.Linear(input_dim * 2, output_dim)
+        )
+
+
+    def forward(self, query_token, img_embed):
+        bs = img_embed.shape[0]
+        # query_token的形状是[bs,768]变成[bs,1,768]
+        cls_tokens_local = query_token.unsqueeze(1) 
+        
+        local_feat_aggr = self.aggregator(query=self.norm_layer_aggr(cls_tokens_local),
+                                          key=self.norm_layer_aggr(img_embed[:, :, :]),
+                                          value=self.norm_layer_aggr(img_embed[:, :, :]))[0] ## 聚合器，使用nn.MultiheadAttention多头注意力机制定义
+        # 坐标检测
+        output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
+        
+        return output_coord
+
 
 class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
     _tied_weights_keys = ["encoder.embed_tokens.weight", "decoder.embed_tokens.weight"]
@@ -2041,6 +2085,9 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
         self.hidden_dim = 256
         self.attn_linear = nn.Linear(config.d_model, self.hidden_dim) ##(768,256)
         self.attn_weight = nn.Linear(self.hidden_dim, 1) 
+        
+        ###定义一个Bbox检测头
+        self.Bbox_Verification = Bbox_Verification(config.d_model) # projection_dim = 768
         
         # Initialize weights and apply final processing
         self.post_init()
@@ -2141,8 +2188,12 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
             ##使用learnable_token做平均得到[]，做一个二分类 推理，即generate的时候就不用走二分类了
             # mean_learnable_token = output_learnable_token.mean(dim=1)  # [bs, 768]
             # classification_logits = self.classifier(mean_learnable_token)
+            ###<---imp2的内容--->
+            # output_coord = self.Bbox_Verification(first_encoder_outputs[0][:,1:577,:]) ##选取image的pathtoken，不要第一个，输入的是[bs,566,768]
             ## 将新的learnable_token替换在inputs_embeds中
             inputs_embeds[:, 577:577+self.learnable_tokens_len, :] = output_learnable_token ## inputs_embeds:[bs,l+learnable_tokens_len,768]
+            ## 将local_feat_aggr插入在inputs_embeds的577+self.learnable_tokens_len之后
+            ###<---imp2的内容--->
 
             encoder_outputs = self.encoder(
                 input_ids=input_ids,
@@ -2292,6 +2343,7 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
 
         
         learnable_token_logits = None
+        output_coord = None
         loss_regular = None
         
         # import traceback
@@ -2370,8 +2422,12 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
             learnable_token_logits = self.classifier(mean_learnable_token)
             learnable_token_logits = self.stable_logits(learnable_token_logits, dim=1) ##使用stable_logits函数防止logits过大导致后续计算损失时softmax溢出
 
+            ###<---imp2的内容--->
+            ### 用mean_learnable_token来查询bbox
+            output_coord = self.Bbox_Verification(mean_learnable_token,first_encoder_outputs[0][:,1:577,:]) ##选取image的pathtoken，不要第一个，输入的是[bs,566,768]
             ## 将新的learnable_token替换在inputs_embeds中
             inputs_embeds[:, 577:577+self.learnable_tokens_len, :] = output_learnable_token ## inputs_embeds:[bs,l+learnable_tokens_len,768]
+            ###<---imp2的内容--->
             
             
 
@@ -2409,7 +2465,7 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
         # #<------regular----------------------------># #
         # loss_regular = self.orthogonal_loss(last_hidden_state[:,577:577+self.learnable_tokens_len,:]) # # 实验表明，放的太靠后会影响AT信息
         
-        logits = [image_classification, text_classification,learnable_token_logits,loss_regular]
+        logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
         
         
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
