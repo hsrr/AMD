@@ -3,7 +3,6 @@ import random
 import argparse
 import torch
 import torch.nn.functional as F
-from torchvision.ops.boxes import box_area
 import json
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -14,7 +13,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import sys, re
 from multilabel_metrics import AveragePrecisionMeter
-import os,math
+import os
 
 import datetime
 import time
@@ -99,60 +98,8 @@ def run_batch(inputs,model,processor):
 
 
 
-def box_iou(boxes1, boxes2, test=False):
-    '''
-    计算两个边界框集合的 IoU（Intersection over Union），
-    并返回每个边界框对的 IoU 值和并集面积。
-    '''
-    area1 = box_area(boxes1)
-    area2 = box_area(boxes2)
-
-    # lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
-    # rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
-    lt = torch.max(boxes1[:, :2], boxes2[:, :2])  # [N,2]
-    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])  # [N,2]
-
-    wh = (rb - lt).clamp(min=0)  # [N,2]
-    # inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-    inter = wh[:, 0] * wh[:, 1]  # [N]
-
-    # union = area1[:, None] + area2 - inter
-    union = area1 + area2 - inter
-
-    iou = inter / union
-
-    if test:
-        zero_lines = boxes2==torch.zeros_like(boxes2)
-        zero_lines_idx = torch.where(zero_lines[:,0]==True)[0]
-
-        for idx in zero_lines_idx:
-            if all(boxes1[idx,:] < 1e-4):
-                iou[idx]=1
-
-    return iou, union
-
-def parse_coordinates(text):
-    # 使用正则表达式匹配坐标
-    pattern = r"<loc_(\d+)><loc_(\d+)><loc_(\d+)><loc_(\d+)>"
-    match = re.search(pattern, text)
-    # print(f'input text is {text}')
-    
-    if match:
-        # 将匹配到的坐标转换为整数
-        loc_x1 = int(match.group(1))
-        loc_y1 = int(match.group(2))
-        loc_x2 = int(match.group(3))
-        loc_y2 = int(match.group(4))
-        # print('解析到的坐标是：')
-        # print(loc_x1, loc_y1, loc_x2, loc_y2)
-        return torch.tensor([[loc_x1, loc_y1, loc_x2, loc_y2]])
-    else:
-        # print('没有match')
-        return torch.tensor([[0, 0, 0, 0]])
-
 def evaluate_model(test_loader, model, processer,device,option_vectors,vectorizer,options,option_labels):
 
-    IOU_pred = []
     cls_nums_all = 0
     cls_acc_all = 0   
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
@@ -163,8 +110,6 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
         
         generated_texts = run_batch(inputs,model,processer)
         task_answers = []
-        output_coords = torch.zeros((len(generated_texts), 4)).to(device)
-        true_coords = torch.zeros((len(generated_texts), 4)).to(device)
         
         
         for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
@@ -173,11 +118,8 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
             
             if '<loc_' in full_answer:
                 task_answers.append(full_answer.split('Manipulated face')[0])
-                output_coords[i] = parse_coordinates(full_answer).to(device)
-                true_coords[i] = parse_coordinates(answers).to(device)
             else:
                 task_answers.append(full_answer)
-                true_coords[i] = parse_coordinates(answers).to(device)
                 
         
                 
@@ -185,15 +127,7 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
         real_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
         real_label[real_label_pos] = 0
         best_options, _ ,best_multi_labels,pred_label = get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
-        IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
 
-        # IOU_pred.extend(IOU.cpu().tolist())
-        for iou_value in IOU.cpu().tolist():
-            if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
-                IOU_pred.append(iou_value)
-            else:
-                IOU_pred.append(0.0)
-        ######################################
         ##--reeal/fake---##
         cls_nums_all += len(generated_texts)
         cls_acc_all += torch.sum(real_label == pred_label).item()
@@ -201,16 +135,13 @@ def evaluate_model(test_loader, model, processer,device,option_vectors,vectorize
         multi_label_meter.add(best_multi_labels, real_multi_label)
         
 
-    IOU_score = sum(IOU_pred)/len(IOU_pred)
-    
-    
     ACC_cls = cls_acc_all / cls_nums_all
     
     MAP = multi_label_meter.value()[:3].mean()
     
     OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
 
-    return ACC_cls, cls_acc_all, cls_nums_all, MAP,OP, OR, OF1, CP, CR, CF1,IOU_score,IOU_pred
+    return ACC_cls, cls_acc_all, cls_nums_all, MAP, OP, OR, OF1, CP, CR, CF1
 
 
 def main():
@@ -299,12 +230,11 @@ def main():
         )
 
         # Evaluate
-        ACC_cls, cls_acc_all, cls_nums_all, MAP, OP, OR, OF1, CP, CR, CF1, IOU_score, IOU_pred = evaluate_model(test_loader,model,processor,device,option_vectors,vectorizer,options,option_labels)
+        ACC_cls, cls_acc_all, cls_nums_all, MAP, OP, OR, OF1, CP, CR, CF1 = evaluate_model(test_loader,model,processor,device,option_vectors,vectorizer,options,option_labels)
 
         log_print('#######<--record-->###########')
         log_print(f"ACC_cls (Accuracy): {ACC_cls*100:.2f} (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
         log_print(f"MAP (Mean Average Precision): {MAP*100:.2f}")
-        log_print(f"IoU Score: {IOU_score*100:.2f}")
         log_print(f"Overall Precision (OP): {OP:.4f}")
         log_print(f"Overall Recall (OR): {OR:.4f}")
         log_print(f"Overall F1 (OF1): {OF1:.4f}")
