@@ -100,21 +100,50 @@ def load_eval_tokenizer(model_id, tokenizer_arg, model_processor):
     )
 
 
+def _resolve_eval_image_path(image_path, image_root):
+    if not isinstance(image_path, str) or len(image_path) == 0:
+        return image_path
+    if os.path.isabs(image_path):
+        return image_path
+    return os.path.join(image_root, image_path)
+
+
+def _apply_image_root_to_records(data, image_root):
+    if not image_root:
+        return data
+
+    rooted_data = []
+    for ann in data:
+        if isinstance(ann, dict) and "image" in ann:
+            ann = dict(ann)
+            ann["image"] = _resolve_eval_image_path(ann["image"], image_root)
+        rooted_data.append(ann)
+    return rooted_data
+
+
 def build_ori_dgm4_dataset(split, data, image_root=None):
     dataset_kwargs = {"split": split, "data": data}
     image_root = None if image_root is None else str(image_root).strip()
-    dataset_params = inspect.signature(OriDGM4Dataset.__init__).parameters
+    try:
+        dataset_params = inspect.signature(OriDGM4Dataset.__init__).parameters
+    except (TypeError, ValueError):
+        dataset_params = {}
 
     if image_root:
         if "image_root" in dataset_params:
             dataset_kwargs["image_root"] = image_root
         else:
-            raise RuntimeError(
-                "This checkout's OriDGM4Dataset does not accept --image-root. "
-                "Update scripts/data.py or omit --image-root."
-            )
+            dataset_kwargs["data"] = _apply_image_root_to_records(data, image_root)
 
-    return OriDGM4Dataset(**dataset_kwargs)
+    try:
+        return OriDGM4Dataset(**dataset_kwargs)
+    except TypeError as exc:
+        # Backward compatibility for older checkouts that do not accept image_root.
+        if image_root and "unexpected keyword argument 'image_root'" in str(exc):
+            dataset_kwargs.pop("image_root", None)
+            dataset_kwargs["data"] = _apply_image_root_to_records(data, image_root)
+            return OriDGM4Dataset(**dataset_kwargs)
+        raise
 
 
 def get_multi_class_index(answers):
