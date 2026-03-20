@@ -73,6 +73,8 @@ class Seq2SeqModelOutput(ModelOutput):
 
 @dataclass
 class Seq2SeqLMOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
     last_hidden_state: torch.FloatTensor = None
     past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     decoder_hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
