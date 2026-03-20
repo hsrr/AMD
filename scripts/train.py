@@ -403,10 +403,10 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
     # Load the model and processor
     model = AutoModelForCausalLM.from_pretrained(
-        AMD_init_pth, trust_remote_code=True
+        AMD_init_pth, trust_remote_code=True, local_files_only=True
     ).to(device)
     processor = AutoProcessor.from_pretrained(
-        AMD_init_pth, trust_remote_code=True
+        AMD_init_pth, trust_remote_code=True, local_files_only=True
     )
     
 
