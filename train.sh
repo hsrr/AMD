@@ -4,10 +4,10 @@ random_seed=12
 export PYTHONHASHSEED=$random_seed
 export CUDA_VISIBLE_DEVICES=0,1,2,3  
 
-MODEL_PTH='AMD/models'
-TRAIN_JS='path/to/train.json'
-VAL_JS='path/to/val.json'
-IMAGE_ROOT='path/to/dataset/root'
+MODEL_PTH='./models'
+TRAIN_JS='/data1/yaxiong/dataset/DGM4/metadata_split/guardian/train.json'
+VAL_JS='/data1/yaxiong/dataset/DGM4/metadata_split/guardian/val.json'
+IMAGE_ROOT='/data1/yaxiong/dataset/'
 
 python scripts/train.py \
     --AMD-init-pth "$MODEL_PTH" \
@@ -21,7 +21,7 @@ python scripts/train.py \
     --regular-weight 2000 \
     --train-js "$TRAIN_JS" \
     --val-js "$VAL_JS" \
-    --train-domain "NYT" \
+    --train-domain "guardian" \
     --seed $random_seed \
     --image-root "$IMAGE_ROOT"
 
