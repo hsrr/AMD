@@ -23,7 +23,7 @@ import math
 
 import numpy as np
 import sys
-sys.path.append('/mnt/da36552c-a636-46f9-9a37-676e692003a2/yuchen/florence2-finetuning')
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from DatasetUtils import pre_caption
 describles_answ = {}
 
