@@ -15,15 +15,15 @@ from multilabel_metrics import AveragePrecisionMeter
 
 
 OPTION_PREFIX_TO_MULTI = {
-    "A": [0, 0, 0, 0],
-    "B": [1, 0, 0, 0],
-    "C": [0, 1, 0, 0],
-    "D": [0, 0, 1, 0],
-    "E": [0, 0, 0, 1],
-    "F": [1, 0, 1, 0],
-    "G": [1, 0, 0, 1],
-    "H": [0, 1, 1, 0],
-    "I": [0, 1, 0, 1],
+    "A": [1, 0, 0, 0, 0],
+    "B": [0, 1, 0, 0, 0],
+    "C": [0, 0, 1, 0, 0],
+    "D": [0, 0, 0, 1, 0],
+    "E": [0, 0, 0, 0, 1],
+    "F": [0, 1, 0, 1, 0],
+    "G": [0, 1, 0, 0, 1],
+    "H": [0, 0, 1, 1, 0],
+    "I": [0, 0, 1, 0, 1],
 }
 
 
@@ -36,7 +36,7 @@ def load_json_or_jsonl(filepath):
 
 
 def get_multi_labels(answers, device):
-    real_multi = torch.zeros((len(answers), 4), dtype=torch.long, device=device)
+    real_multi = torch.zeros((len(answers), 5), dtype=torch.long, device=device)
     for idx, ans in enumerate(answers):
         prefix = ans.strip()[:1].upper() if isinstance(ans, str) and len(ans.strip()) > 0 else ""
         if prefix in OPTION_PREFIX_TO_MULTI:
@@ -56,8 +56,10 @@ def fuse_multilabel_logits(logits_list):
 
 def compute_multilabel_scores(pred_multi, real_multi, prob_scores):
     eps = 1e-8
-    pred_np = pred_multi.detach().cpu().numpy().astype(np.int64)
-    real_np = real_multi.detach().cpu().numpy().astype(np.int64)
+    # DGM4多标签指标按4类篡改类型计算（FS/FA/TS/TA）
+    pred_np = pred_multi[:, 1:].detach().cpu().numpy().astype(np.int64)
+    real_np = real_multi[:, 1:].detach().cpu().numpy().astype(np.int64)
+    tamper_scores = prob_scores[:, 1:]
 
     tp = np.sum((pred_np == 1) & (real_np == 1), axis=0).astype(np.float64)
     fp = np.sum((pred_np == 1) & (real_np == 0), axis=0).astype(np.float64)
@@ -80,9 +82,9 @@ def compute_multilabel_scores(pred_multi, real_multi, prob_scores):
 
     ap_meter = AveragePrecisionMeter(difficult_examples=False)
     ap_meter.reset()
-    ap_meter.add(prob_scores.detach().cpu(), real_multi.detach().cpu())
+    ap_meter.add(tamper_scores.detach().cpu(), real_multi[:, 1:].detach().cpu())
     ap_values = ap_meter.value()
-    map_score = float(ap_values[:4].mean().item()) if torch.is_tensor(ap_values) else 0.0
+    map_score = float(ap_values.mean().item()) if torch.is_tensor(ap_values) else 0.0
 
     return {
         "f1_fs": float(f1_cls[0]),
@@ -164,7 +166,7 @@ def main():
         return inputs, answers
 
     log_print(f"Test model_id is: {args.model_id}")
-    log_print("evaluate by 4-dim multilabel head (FS/FA/TS/TA)")
+    log_print("evaluate by 5-dim multilabel head (No/FS/FA/TS/TA), DGM4 metrics on FS/FA/TS/TA")
 
     for val_js in args.vals:
         val_data = load_json_or_jsonl(val_js)

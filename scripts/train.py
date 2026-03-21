@@ -167,20 +167,20 @@ def create_data_loaders(
     return train_loader, val_loaders
 
 OPTION_PREFIX_TO_MULTI = {
-    "A": [0, 0, 0, 0],  # No
-    "B": [1, 0, 0, 0],  # FS
-    "C": [0, 1, 0, 0],  # FA
-    "D": [0, 0, 1, 0],  # TS
-    "E": [0, 0, 0, 1],  # TA
-    "F": [1, 0, 1, 0],  # FS + TS
-    "G": [1, 0, 0, 1],  # FS + TA
-    "H": [0, 1, 1, 0],  # FA + TS
-    "I": [0, 1, 0, 1],  # FA + TA
+    "A": [1, 0, 0, 0, 0],  # No
+    "B": [0, 1, 0, 0, 0],  # FS
+    "C": [0, 0, 1, 0, 0],  # FA
+    "D": [0, 0, 0, 1, 0],  # TS
+    "E": [0, 0, 0, 0, 1],  # TA
+    "F": [0, 1, 0, 1, 0],  # FS + TS
+    "G": [0, 1, 0, 0, 1],  # FS + TA
+    "H": [0, 0, 1, 1, 0],  # FA + TS
+    "I": [0, 0, 1, 0, 1],  # FA + TA
 }
 
 
 def get_multi_label(answers, device):
-    multi_label = torch.zeros((len(answers), 4), dtype=torch.float32, device=device)
+    multi_label = torch.zeros((len(answers), 5), dtype=torch.float32, device=device)
     for idx, answer in enumerate(answers):
         prefix = answer.strip()[:1].upper() if isinstance(answer, str) and len(answer.strip()) > 0 else ""
         if prefix in OPTION_PREFIX_TO_MULTI:
@@ -200,8 +200,10 @@ def fuse_multilabel_logits(logits_list):
 
 def compute_multilabel_metrics(pred_labels, gt_labels, prob_scores):
     eps = 1e-8
-    pred_np = pred_labels.detach().cpu().numpy().astype(np.int64)
-    gt_np = gt_labels.detach().cpu().numpy().astype(np.int64)
+    # DGM4指标按4类篡改类型计算：FS/FA/TS/TA，不包含"No"维度
+    pred_np = pred_labels[:, 1:].detach().cpu().numpy().astype(np.int64)
+    gt_np = gt_labels[:, 1:].detach().cpu().numpy().astype(np.int64)
+    prob_np = prob_scores[:, 1:]
 
     tp = np.sum((pred_np == 1) & (gt_np == 1), axis=0).astype(np.float64)
     fp = np.sum((pred_np == 1) & (gt_np == 0), axis=0).astype(np.float64)
@@ -224,10 +226,10 @@ def compute_multilabel_metrics(pred_labels, gt_labels, prob_scores):
 
     ap_meter = AveragePrecisionMeter(difficult_examples=False)
     ap_meter.reset()
-    ap_meter.add(prob_scores.detach().cpu(), gt_labels.detach().cpu().long())
+    ap_meter.add(prob_np.detach().cpu(), gt_labels[:, 1:].detach().cpu().long())
     ap_values = ap_meter.value()
     if torch.is_tensor(ap_values):
-        map_score = float(ap_values[:4].mean().item())
+        map_score = float(ap_values.mean().item())
     else:
         map_score = 0.0
 
@@ -462,6 +464,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         # Training phase
         model.train()
         train_loss = 0
+        LLM_loss = 0
         image_loss = 0
         text_loss = 0
         LT_loss = 0
@@ -474,10 +477,20 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             # Prepare the input and target tensors
             input_ids = inputs["input_ids"].to(device)
             pixel_values = inputs["pixel_values"].to(device)
+            labels = processor.tokenizer(
+                text=answers,
+                return_tensors="pt",
+                padding=True,
+                return_token_type_ids=False,
+                truncation=True,
+                max_length=800,
+            ).input_ids.to(device)
             outputs = model(
-                input_ids=input_ids, pixel_values=pixel_values
+                input_ids=input_ids, pixel_values=pixel_values, labels=labels
             )
-            total_loss = torch.tensor(0.0, device=device)
+            if outputs.loss is None:
+                raise RuntimeError("模型未返回LM loss，无法按原始训练方式执行")
+            total_loss = outputs.loss
             multi_labels = get_multi_label(answers, device)
             temp_loss0 = torch.tensor(0.0, device=device)
             temp_loss1 = torch.tensor(0.0, device=device)
@@ -520,6 +533,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             optimizer.zero_grad()
 
             train_loss += total_loss.item()
+            LLM_loss += outputs.loss.item()
             image_loss += temp_loss0.item()
             text_loss += temp_loss1.item()
             LT_loss += temp_loss2.item()
@@ -530,10 +544,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             if rank == 0:
                 if (global_step + 1) % 100 == 0:
                     print(f"  [Step {global_step+1}] "
-                          f"total={total_loss.item():.4f} "
+                          f"total={total_loss.item():.4f} LLM={outputs.loss.item():.4f} "
                           f"img={temp_loss0.item():.4f} txt={temp_loss1.item():.4f} "
                           f"LT={temp_loss2.item():.4f} reg={reg_loss.item():.4f}")
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
+                wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_image_loss": temp_loss0.item()})
                 wandb.log({"step": global_step + 1, "step_avg_text_loss": temp_loss1.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": temp_loss2.item()})
@@ -548,6 +563,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
         # Log training loss to wandb
         avg_train_loss = train_loss / len(train_loader)
+        avg_LLM_loss = LLM_loss / len(train_loader)
         avg_image_loss = image_loss / len(train_loader)
         avg_text_loss = text_loss / len(train_loader)
         avg_LT_loss = LT_loss / len(train_loader)
@@ -556,10 +572,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         
         if rank == 0:
             print(f"[Epoch {epoch+1}/{epochs}] "
-                  f"total_loss={avg_train_loss:.4f} "
+                  f"total_loss={avg_train_loss:.4f} LLM={avg_LLM_loss:.4f} "
                   f"image_cls={avg_image_loss:.4f} text_cls={avg_text_loss:.4f} "
                   f"LT_cls={avg_LT_loss:.4f} regular={avg_regular_loss:.4f}")
             wandb.log({"epoch": epoch + 1, "epoch_train_loss": avg_train_loss})
+            wandb.log({"epoch": epoch + 1, "epoch_avg_LLM_loss": avg_LLM_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_image_loss": avg_image_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_text_loss": avg_text_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_LearnableToken_loss": avg_LT_loss})

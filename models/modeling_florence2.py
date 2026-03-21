@@ -2078,10 +2078,10 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
         self.learnable_tokens = nn.Parameter(torch.randn(self.learnable_tokens_len, config.d_model)) #[32,768]
         
 
-        # 4维多标签分类头（FS/FA/TS/TA），每个维度独立二分类
-        self.classifier = nn.Linear(config.d_model, 4)
-        # 第二次forward中的两个模态共用同一个4维多标签分类头
-        self.Second_classifier = nn.Linear(config.d_model, 4) # config.d_model 是hiden_size 在base model 中是768
+        # 5维多标签分类头（No/FS/FA/TS/TA），每个维度独立二分类
+        self.classifier = nn.Linear(config.d_model, 5)
+        # 第二次forward中的两个模态共用同一个5维多标签分类头
+        self.Second_classifier = nn.Linear(config.d_model, 5) # config.d_model 是hiden_size 在base model 中是768
 
         # 在实现2.中 Learnable Token的加权聚合——初始化注意力层
         self.hidden_dim = 256
@@ -2421,8 +2421,8 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
             
             # #<<----------不同的learnable Token处理方法---------->>
             
+            # 多标签 BCE 需要每个维度的绝对logit，不做按维平移
             learnable_token_logits = self.classifier(mean_learnable_token)
-            learnable_token_logits = self.stable_logits(learnable_token_logits, dim=1) ##使用stable_logits函数防止logits过大导致后续计算损失时softmax溢出
 
             ###<---imp2的内容--->
             ### 用mean_learnable_token来查询bbox
@@ -2460,7 +2460,7 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
         text_attention_output = self.attention(Text_emb, Image_LearnableToken_emb, Image_LearnableToken_emb)
         ### imp3中第一次Forward的用于learnable_token的分类器叫classifier
         ### 这里引入imp1的分类器，叫Second_classifier，两个模态共用一个分类器
-        image_classification = self.Second_classifier(image_attention_output)  # (batch_size, 2)
+        image_classification = self.Second_classifier(image_attention_output)  # (batch_size, 5)
         text_classification = self.Second_classifier(text_attention_output)   
         # #<------forward2---imp1----------------------------># #
 
