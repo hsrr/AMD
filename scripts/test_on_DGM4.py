@@ -3,30 +3,27 @@ import datetime
 import json
 import logging
 import os
-import re
 
 import numpy as np
 import torch
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics.pairwise import cosine_similarity
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-from data import DGM4_Dataset, describles_answ
+from data import DGM4_Dataset
+from multilabel_metrics import AveragePrecisionMeter
 
 
-FAKE_CLS_TO_MULTI = {
-    "orig": [0, 0, 0, 0],
-    "face_swap": [1, 0, 0, 0],
-    "face_attribute": [0, 1, 0, 0],
-    "text_swap": [0, 0, 1, 0],
-    "text_attribute": [0, 0, 0, 1],
-    "face_swap&text_swap": [1, 0, 1, 0],
-    "face_swap&text_attribute": [1, 0, 0, 1],
-    "face_attribute&text_swap": [0, 1, 1, 0],
-    "face_attribute&text_attribute": [0, 1, 0, 1],
+OPTION_PREFIX_TO_MULTI = {
+    "A": [0, 0, 0, 0],
+    "B": [1, 0, 0, 0],
+    "C": [0, 1, 0, 0],
+    "D": [0, 0, 1, 0],
+    "E": [0, 0, 0, 1],
+    "F": [1, 0, 1, 0],
+    "G": [1, 0, 0, 1],
+    "H": [0, 1, 1, 0],
+    "I": [0, 1, 0, 1],
 }
 
 
@@ -38,140 +35,97 @@ def load_json_or_jsonl(filepath):
     return [json.loads(line) for line in content.splitlines() if line.strip()]
 
 
-def build_option_space(device):
-    options = list(describles_answ.values())
-    option_labels = [
-        torch.tensor(FAKE_CLS_TO_MULTI[fake_cls], dtype=torch.long, device=device)
-        for fake_cls in describles_answ.keys()
-    ]
-    option_to_multi = {
-        describles_answ[fake_cls]: torch.tensor(
-            FAKE_CLS_TO_MULTI[fake_cls], dtype=torch.long, device=device
-        )
-        for fake_cls in describles_answ.keys()
-    }
-    return options, option_labels, option_to_multi
-
-
-def normalize_generated_answer(text):
-    text = re.sub(r"<pad>|<s>|</s>", "", text).strip()
-    if "Swapped words:" in text:
-        text = text.split("Swapped words:")[0].strip()
-    if "Manipulated face" in text:
-        text = text.split("Manipulated face")[0].strip()
-    return text
-
-
-def find_option_from_text(text, options):
-    for option in options:
-        if option in text:
-            return option
-    return options[0]
-
-
-def get_multi_and_binary_labels(answers, options, option_to_multi, device):
+def get_multi_labels(answers, device):
     real_multi = torch.zeros((len(answers), 4), dtype=torch.long, device=device)
-    real_binary = torch.zeros(len(answers), dtype=torch.long, device=device)
     for idx, ans in enumerate(answers):
-        matched_option = find_option_from_text(ans, options)
-        real_multi[idx] = option_to_multi[matched_option]
-        if matched_option != options[0]:
-            real_binary[idx] = 1
-    return real_multi, real_binary
+        prefix = ans.strip()[:1].upper() if isinstance(ans, str) and len(ans.strip()) > 0 else ""
+        if prefix in OPTION_PREFIX_TO_MULTI:
+            real_multi[idx] = torch.tensor(OPTION_PREFIX_TO_MULTI[prefix], dtype=torch.long, device=device)
+    return real_multi
 
 
-def get_best_option(generated_texts, option_vectors, vectorizer, options, option_labels, device):
-    generated_vectors = vectorizer.transform(generated_texts).toarray()
-    similarities = cosine_similarity(generated_vectors, option_vectors)
-    best_option_indices = similarities.argmax(axis=1)
-    best_options = [options[i] for i in best_option_indices]
-    best_multi_labels = torch.stack([option_labels[i] for i in best_option_indices], dim=0)
-
-    pred_binary = torch.ones(len(generated_texts), dtype=torch.long, device=device)
-    pred_binary[np.array(best_option_indices) == 0] = 0
-    fake_scores = similarities[:, 1:].max(axis=1)
-
-    return best_options, best_multi_labels, pred_binary, fake_scores
+def fuse_multilabel_logits(logits_list):
+    valid_logits = []
+    for idx in (0, 1, 2):
+        if idx < len(logits_list) and logits_list[idx] is not None:
+            valid_logits.append(logits_list[idx])
+    if not valid_logits:
+        raise RuntimeError("classification_logits_list[0/1/2] all None, cannot evaluate")
+    return torch.stack(valid_logits, dim=0).mean(dim=0)
 
 
-def compute_multilabel_scores(pred_multi, real_multi):
+def compute_multilabel_scores(pred_multi, real_multi, prob_scores):
+    eps = 1e-8
     pred_np = pred_multi.detach().cpu().numpy().astype(np.int64)
     real_np = real_multi.detach().cpu().numpy().astype(np.int64)
 
-    nc = np.sum((pred_np == 1) & (real_np == 1), axis=0).astype(np.float64)
-    npred = np.sum(pred_np == 1, axis=0).astype(np.float64)
-    ngt = np.sum(real_np == 1, axis=0).astype(np.float64)
+    tp = np.sum((pred_np == 1) & (real_np == 1), axis=0).astype(np.float64)
+    fp = np.sum((pred_np == 1) & (real_np == 0), axis=0).astype(np.float64)
+    fn = np.sum((pred_np == 0) & (real_np == 1), axis=0).astype(np.float64)
 
-    op = float(np.sum(nc) / np.sum(npred)) if np.sum(npred) > 0 else 0.0
-    orr = float(np.sum(nc) / np.sum(ngt)) if np.sum(ngt) > 0 else 0.0
-    of1 = float((2 * op * orr) / (op + orr)) if (op + orr) > 0 else 0.0
+    p_cls = tp / (tp + fp + eps)
+    r_cls = tp / (tp + fn + eps)
+    f1_cls = 2 * p_cls * r_cls / (p_cls + r_cls + eps)
 
-    cp_per_cls = np.divide(nc, npred, out=np.zeros_like(nc), where=npred > 0)
-    cr_per_cls = np.divide(nc, ngt, out=np.zeros_like(nc), where=ngt > 0)
-    cp = float(np.mean(cp_per_cls))
-    cr = float(np.mean(cr_per_cls))
-    cf1 = float((2 * cp * cr) / (cp + cr)) if (cp + cr) > 0 else 0.0
+    op = float(tp.sum() / (tp.sum() + fp.sum() + eps))
+    orr = float(tp.sum() / (tp.sum() + fn.sum() + eps))
+    of1 = float(2 * op * orr / (op + orr + eps))
 
-    multi_acc = float(np.mean(np.all(pred_np == real_np, axis=1)))
-    return cf1, of1, multi_acc
+    cp = float(np.mean(p_cls))
+    cr = float(np.mean(r_cls))
+    cf1 = float(2 * cp * cr / (cp + cr + eps))
+
+    label_acc = float(np.mean(pred_np == real_np))
+    sample_acc = float(np.mean(np.all(pred_np == real_np, axis=1)))
+
+    ap_meter = AveragePrecisionMeter(difficult_examples=False)
+    ap_meter.reset()
+    ap_meter.add(prob_scores.detach().cpu(), real_multi.detach().cpu())
+    ap_values = ap_meter.value()
+    map_score = float(ap_values[:4].mean().item()) if torch.is_tensor(ap_values) else 0.0
+
+    return {
+        "f1_fs": float(f1_cls[0]),
+        "f1_fa": float(f1_cls[1]),
+        "f1_ts": float(f1_cls[2]),
+        "f1_ta": float(f1_cls[3]),
+        "op": op,
+        "or": orr,
+        "of1": of1,
+        "cp": cp,
+        "cr": cr,
+        "cf1": cf1,
+        "map": map_score,
+        "label_acc": label_acc,
+        "sample_acc": sample_acc,
+    }
 
 
-def evaluate_model(test_loader, model, processor, device, option_vectors, vectorizer, options, option_labels, option_to_multi):
-    all_real_binary = []
-    all_pred_binary = []
-    all_fake_scores = []
+def evaluate_model(test_loader, model, device):
     all_real_multi = []
     all_pred_multi = []
+    all_prob_scores = []
 
     for inputs, batch_answers in tqdm(test_loader, desc="Evaluating"):
-        generated_ids = model.generate(
+        outputs = model(
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024,
-            num_beams=3,
         )
-        generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
-        cleaned_answers = [normalize_generated_answer(text) for text in generated_texts]
+        fused_logits = fuse_multilabel_logits(outputs.classification_logits_list)
+        prob_scores = torch.sigmoid(fused_logits)
+        pred_multi = (prob_scores >= 0.5).long()
+        real_multi = get_multi_labels(batch_answers, device)
 
-        real_multi, real_binary = get_multi_and_binary_labels(
-            batch_answers, options, option_to_multi, device
-        )
-        _, pred_multi, pred_binary, fake_scores = get_best_option(
-            cleaned_answers, option_vectors, vectorizer, options, option_labels, device
-        )
-
-        all_real_binary.append(real_binary)
-        all_pred_binary.append(pred_binary)
-        all_fake_scores.append(torch.tensor(fake_scores, dtype=torch.float32, device=device))
         all_real_multi.append(real_multi)
         all_pred_multi.append(pred_multi)
-
-    real_binary = torch.cat(all_real_binary, dim=0)
-    pred_binary = torch.cat(all_pred_binary, dim=0)
-    fake_scores = torch.cat(all_fake_scores, dim=0).detach().cpu().numpy()
-    real_binary_np = real_binary.detach().cpu().numpy()
-    pred_binary_np = pred_binary.detach().cpu().numpy()
-
-    binary_acc = float(np.mean(real_binary_np == pred_binary_np))
-    binary_err = 1.0 - binary_acc
-    try:
-        binary_auc = float(roc_auc_score(real_binary_np, fake_scores))
-    except ValueError:
-        binary_auc = float("nan")
+        all_prob_scores.append(prob_scores)
 
     real_multi = torch.cat(all_real_multi, dim=0)
     pred_multi = torch.cat(all_pred_multi, dim=0)
-    multi_cf1, multi_of1, multi_acc = compute_multilabel_scores(pred_multi, real_multi)
-
-    return {
-        "binary_auc": binary_auc,
-        "binary_err": binary_err,
-        "binary_acc": binary_acc,
-        "multi_cf1": multi_cf1,
-        "multi_of1": multi_of1,
-        "multi_acc": multi_acc,
-        "count": int(real_binary.size(0)),
-    }
+    prob_scores = torch.cat(all_prob_scores, dim=0)
+    metrics = compute_multilabel_scores(pred_multi, real_multi, prob_scores)
+    metrics["count"] = int(real_multi.size(0))
+    return metrics
 
 
 def main():
@@ -193,12 +147,10 @@ def main():
     output_file = args.output_file or os.path.join(args.model_id, f"domain_test_out_{timestamp}.txt")
 
     device = torch.device(f"cuda:{args.GPU_nu}" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, trust_remote_code=True).eval().to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id, trust_remote_code=True, ignore_mismatched_sizes=True
+    ).eval().to(device)
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
-
-    options, option_labels, option_to_multi = build_option_space(device)
-    vectorizer = TfidfVectorizer().fit(options)
-    option_vectors = vectorizer.transform(options).toarray()
 
     logging.basicConfig(level=logging.INFO)
 
@@ -213,7 +165,7 @@ def main():
         return inputs, answers
 
     log_print(f"test model_id is {args.model_id}")
-    log_print(f"options from data.py prompt: {len(options)} classes")
+    log_print("evaluate by 4-dim multilabel head (FS/FA/TS/TA)")
 
     for val_js in args.vals:
         val_data = load_json_or_jsonl(val_js)
@@ -229,24 +181,25 @@ def main():
         metrics = evaluate_model(
             test_loader=test_loader,
             model=model,
-            processor=processor,
             device=device,
-            option_vectors=option_vectors,
-            vectorizer=vectorizer,
-            options=options,
-            option_labels=option_labels,
-            option_to_multi=option_to_multi,
         )
 
         log_print("#######<--record-->###########")
         log_print(f"dataset: {val_js}")
         log_print(f"samples: {metrics['count']}")
-        log_print(f"Binary AUC: {metrics['binary_auc']:.6f}")
-        log_print(f"Binary ERR: {metrics['binary_err']:.6f}")
-        log_print(f"Binary ACC: {metrics['binary_acc']:.6f}")
-        log_print(f"Multi CF1: {metrics['multi_cf1']:.6f}")
-        log_print(f"Multi OF1: {metrics['multi_of1']:.6f}")
-        log_print(f"Multi ACC: {metrics['multi_acc']:.6f}")
+        log_print(f"F1_FS: {metrics['f1_fs']:.6f}")
+        log_print(f"F1_FA: {metrics['f1_fa']:.6f}")
+        log_print(f"F1_TS: {metrics['f1_ts']:.6f}")
+        log_print(f"F1_TA: {metrics['f1_ta']:.6f}")
+        log_print(f"OP: {metrics['op']:.6f}")
+        log_print(f"OR: {metrics['or']:.6f}")
+        log_print(f"OF1: {metrics['of1']:.6f}")
+        log_print(f"CP: {metrics['cp']:.6f}")
+        log_print(f"CR: {metrics['cr']:.6f}")
+        log_print(f"CF1: {metrics['cf1']:.6f}")
+        log_print(f"mAP: {metrics['map']:.6f}")
+        log_print(f"Label ACC: {metrics['label_acc']:.6f}")
+        log_print(f"Sample ACC: {metrics['sample_acc']:.6f}")
         log_print("########<--record-->#########")
 
     print(f"log at {output_file}")

@@ -2078,10 +2078,10 @@ class Florence2LanguageModel(Florence2LanguagePreTrainedModel):
         self.learnable_tokens = nn.Parameter(torch.randn(self.learnable_tokens_len, config.d_model)) #[32,768]
         
 
-        #二分类器_用于learnable_token分类
-        self.classifier = nn.Linear(config.d_model, 2)
-        #定义一个二分类头_用于第二次forward中两个模态的分类
-        self.Second_classifier = nn.Linear(config.d_model, 2) # config.d_model 是hiden_size 在base model 中是768
+        # 4维多标签分类头（FS/FA/TS/TA），每个维度独立二分类
+        self.classifier = nn.Linear(config.d_model, 4)
+        # 第二次forward中的两个模态共用同一个4维多标签分类头
+        self.Second_classifier = nn.Linear(config.d_model, 4) # config.d_model 是hiden_size 在base model 中是768
 
         # 在实现2.中 Learnable Token的加权聚合——初始化注意力层
         self.hidden_dim = 256

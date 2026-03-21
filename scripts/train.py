@@ -23,8 +23,6 @@ import wandb
 from data import DocVQADataset, TheCauldronDataset, VQAInstructDataset,DGM4_Dataset
 from peft import LoraConfig, get_peft_model
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import sys
 from multilabel_metrics import AveragePrecisionMeter
 from torchvision.ops.boxes import box_area
@@ -168,65 +166,86 @@ def create_data_loaders(
 
     return train_loader, val_loaders
 
-def get_multi_label(answers,device):
-    multi_label = torch.zeros([len(answers), 4], dtype=torch.long).to(device)
-    
-    real_label_pos = [i for i, ans in enumerate(answers) if 'A. No.' in ans]
-    
-    pos = [i for i, ans in enumerate(answers) if 'B. Only face swap.' in ans]
-    multi_label[pos, :] = torch.tensor([1, 0, 0, 0]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'C. Only face attribute.' in ans]
-    multi_label[pos, :] = torch.tensor([0, 1, 0, 0]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'D. Only text swap.' in ans]
-    multi_label[pos, :] = torch.tensor([0, 0, 1, 0]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'E. Only text attribute.' in ans]
-    multi_label[pos, :] = torch.tensor([0, 0, 0, 1]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'F. Face swap and text swap.' in ans]
-    multi_label[pos, :] = torch.tensor([1, 0, 1, 0]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'G. Face swap and text attribute.' in ans]
-    multi_label[pos, :] = torch.tensor([1, 0, 0, 1]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'H. Face attribute and text swap.' in ans]
-    multi_label[pos, :] = torch.tensor([0, 1, 1, 0]).to(device)
-    
-    pos = [i for i, ans in enumerate(answers) if 'I. Face attribute and text attribute.' in ans]
-    multi_label[pos, :] = torch.tensor([0, 1, 0, 1]).to(device)
-    
-    return multi_label, real_label_pos
+OPTION_PREFIX_TO_MULTI = {
+    "A": [0, 0, 0, 0],  # No
+    "B": [1, 0, 0, 0],  # FS
+    "C": [0, 1, 0, 0],  # FA
+    "D": [0, 0, 1, 0],  # TS
+    "E": [0, 0, 0, 1],  # TA
+    "F": [1, 0, 1, 0],  # FS + TS
+    "G": [1, 0, 0, 1],  # FS + TA
+    "H": [0, 1, 1, 0],  # FA + TS
+    "I": [0, 1, 0, 1],  # FA + TA
+}
 
-def get_best_option(generated_texts, option_vectors,vectorizer,options,option_labels,device):
-    '''批量计算模型的输出对应哪一个选项
-    输入是生成的多个文本，和固定选项的向量表示
-    '''
-    # 将生成文本批量转换为向量
-    generated_vectors = vectorizer.transform(generated_texts).toarray()
 
-    # 计算相似度
-    similarities = cosine_similarity(generated_vectors, option_vectors)
+def get_multi_label(answers, device):
+    multi_label = torch.zeros((len(answers), 4), dtype=torch.float32, device=device)
+    for idx, answer in enumerate(answers):
+        prefix = answer.strip()[:1].upper() if isinstance(answer, str) and len(answer.strip()) > 0 else ""
+        if prefix in OPTION_PREFIX_TO_MULTI:
+            multi_label[idx] = torch.tensor(OPTION_PREFIX_TO_MULTI[prefix], dtype=torch.float32, device=device)
+    return multi_label
 
-    # 获取每个生成文本的相似度最高的选项
-    best_option_indices = similarities.argmax(axis=1)
 
-    # 返回选项、相似度和对应的01标签
-    best_options = [options[i] for i in best_option_indices]
-    best_similarities = [similarities[i, best_option_indices[i]] for i in range(len(generated_texts))]
+def fuse_multilabel_logits(logits_list):
+    valid_logits = []
+    for idx in (0, 1, 2):
+        if idx < len(logits_list) and logits_list[idx] is not None:
+            valid_logits.append(logits_list[idx])
+    if not valid_logits:
+        raise RuntimeError("classification_logits_list[0/1/2] all None, cannot compute multilabel logits")
+    return torch.stack(valid_logits, dim=0).mean(dim=0)
 
-    best_multi_labels = torch.stack([option_labels[i] for i in best_option_indices], dim=0)
-    # 对 best_multi_labels 进行归一化
-    # best_multi_labels_prob = F.softmax(best_multi_labels.float(), dim=1)
-    
-    #ori_pos，构造模型输出对应的单分类标签
-    pred_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
-    real_label_pos = np.where(np.array(best_options) == 'A. No.')[0].tolist()
-    # 是A. No.的地方设置为 0 --代表real图文
-    pred_label[real_label_pos] = 0
-    
-    return best_options, best_similarities, best_multi_labels,pred_label
+
+def compute_multilabel_metrics(pred_labels, gt_labels, prob_scores):
+    eps = 1e-8
+    pred_np = pred_labels.detach().cpu().numpy().astype(np.int64)
+    gt_np = gt_labels.detach().cpu().numpy().astype(np.int64)
+
+    tp = np.sum((pred_np == 1) & (gt_np == 1), axis=0).astype(np.float64)
+    fp = np.sum((pred_np == 1) & (gt_np == 0), axis=0).astype(np.float64)
+    fn = np.sum((pred_np == 0) & (gt_np == 1), axis=0).astype(np.float64)
+
+    p_cls = tp / (tp + fp + eps)
+    r_cls = tp / (tp + fn + eps)
+    f1_cls = 2 * p_cls * r_cls / (p_cls + r_cls + eps)
+
+    op = float(tp.sum() / (tp.sum() + fp.sum() + eps))
+    orr = float(tp.sum() / (tp.sum() + fn.sum() + eps))
+    of1 = float(2 * op * orr / (op + orr + eps))
+
+    cp = float(np.mean(p_cls))
+    cr = float(np.mean(r_cls))
+    cf1 = float(2 * cp * cr / (cp + cr + eps))
+
+    label_acc = float(np.mean(pred_np == gt_np))
+    sample_acc = float(np.mean(np.all(pred_np == gt_np, axis=1)))
+
+    ap_meter = AveragePrecisionMeter(difficult_examples=False)
+    ap_meter.reset()
+    ap_meter.add(prob_scores.detach().cpu(), gt_labels.detach().cpu().long())
+    ap_values = ap_meter.value()
+    if torch.is_tensor(ap_values):
+        map_score = float(ap_values[:4].mean().item())
+    else:
+        map_score = 0.0
+
+    return {
+        "f1_fs": float(f1_cls[0]),
+        "f1_fa": float(f1_cls[1]),
+        "f1_ts": float(f1_cls[2]),
+        "f1_ta": float(f1_cls[3]),
+        "op": op,
+        "or": orr,
+        "of1": of1,
+        "cp": cp,
+        "cr": cr,
+        "cf1": cf1,
+        "map": map_score,
+        "label_acc": label_acc,
+        "sample_acc": sample_acc,
+    }
 
 def synchronize_metrics(metric_tensor, world_size):
     """
@@ -260,67 +279,72 @@ def parse_coordinates(text):
         return torch.tensor([[0, 0, 0, 0]])
 
 
-def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels):
+def evaluate_model(rank, world_size, model, val_loaders, device, global_step, max_val_item_count):
 
     # Evaluation phase
     model.eval()
     with torch.no_grad():
         for val_name, val_loader in val_loaders.items():
             val_item_count = 0
-            cls_nums_all = 0
-            cls_acc_all = 0
-            multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
-            multi_label_meter.reset()
+            all_probs = []
+            all_preds = []
+            all_targets = []
             for batch in tqdm(val_loader, desc=f"Evaluation on {val_name} at step {global_step}", position=rank):
                 inputs, batch_answers = batch
-                val_item_count += len(inputs)
-                generated_ids = model.module.generate(
+                batch_size = inputs["input_ids"].size(0)
+                val_item_count += batch_size
+
+                outputs = model(
                     input_ids=inputs["input_ids"],
                     pixel_values=inputs["pixel_values"],
-                    max_new_tokens=1024,
-                    num_beams=3,
                 )
-                generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
-                
-                task_answers = []
-                
-                for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
-                    full_answer = re.sub(r"<pad>|<s>|</s>", "", generated_text)
-                    task_answers.append(full_answer)
-                
-                
-                real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
-                real_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
-                real_label[real_label_pos] = 0
-                best_options, _ ,best_multi_labels,pred_label = get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
-                
-                ##--reeal/fake---##
-                cls_nums_all = val_item_count
-                cls_acc_all += torch.sum(real_label == pred_label).item()
-                
-                ##-multi--##
-                multi_label_meter.add(best_multi_labels, real_multi_label)
-                
-                local_ACC_cls = cls_acc_all / cls_nums_all
-                local_MAP = multi_label_meter.value()[:4].mean().item()
+                fused_logits = fuse_multilabel_logits(outputs.classification_logits_list)
+                prob_scores = torch.sigmoid(fused_logits)
+                pred_labels = (prob_scores >= 0.5).long()
+                gt_labels = get_multi_label(batch_answers, device).long()
 
+                all_probs.append(prob_scores)
+                all_preds.append(pred_labels)
+                all_targets.append(gt_labels)
 
                 if val_item_count > max_val_item_count:
                     break
-        local_ACC_cls_tensor = torch.tensor(local_ACC_cls, device=device)
-        local_MAP_tensor = torch.tensor(local_MAP, device=device)
 
+            if len(all_targets) == 0:
+                continue
 
-        ACC_cls = synchronize_metrics(local_ACC_cls_tensor, world_size)
-        MAP = synchronize_metrics(local_MAP_tensor, world_size)
+            probs = torch.cat(all_probs, dim=0)
+            preds = torch.cat(all_preds, dim=0)
+            targets = torch.cat(all_targets, dim=0)
+            local_metrics = compute_multilabel_metrics(preds, targets, probs)
 
-        if dist.get_rank() == 0:
-            print(f"Rank {rank} - Step {global_step} - ACC: {ACC_cls.item():.4f} MAP: {MAP.item():.4f} ({val_name})")
-            wandb.log({
-                f"{val_name}_ACC_cls": ACC_cls.item(),
-                f"{val_name}_MAP": MAP.item(),
-                "step": global_step
-            })
+            synced_metrics = {}
+            for metric_name, metric_value in local_metrics.items():
+                metric_tensor = torch.tensor(metric_value, dtype=torch.float32, device=device)
+                synced_metrics[metric_name] = synchronize_metrics(metric_tensor, world_size)
+
+            if dist.get_rank() == 0:
+                print(
+                    f"Rank {rank} - Step {global_step} - {val_name} "
+                    f"CF1={synced_metrics['cf1'].item():.4f} OF1={synced_metrics['of1'].item():.4f} "
+                    f"mAP={synced_metrics['map'].item():.4f} label_acc={synced_metrics['label_acc'].item():.4f}"
+                )
+                wandb.log({
+                    f"{val_name}_F1_FS": synced_metrics["f1_fs"].item(),
+                    f"{val_name}_F1_FA": synced_metrics["f1_fa"].item(),
+                    f"{val_name}_F1_TS": synced_metrics["f1_ts"].item(),
+                    f"{val_name}_F1_TA": synced_metrics["f1_ta"].item(),
+                    f"{val_name}_OP": synced_metrics["op"].item(),
+                    f"{val_name}_OR": synced_metrics["or"].item(),
+                    f"{val_name}_OF1": synced_metrics["of1"].item(),
+                    f"{val_name}_CP": synced_metrics["cp"].item(),
+                    f"{val_name}_CR": synced_metrics["cr"].item(),
+                    f"{val_name}_CF1": synced_metrics["cf1"].item(),
+                    f"{val_name}_MAP": synced_metrics["map"].item(),
+                    f"{val_name}_label_acc": synced_metrics["label_acc"].item(),
+                    f"{val_name}_sample_acc": synced_metrics["sample_acc"].item(),
+                    "step": global_step,
+                })
             
     model.train()
 
@@ -337,38 +361,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
     train_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     local_train_name = f'{logged_task_name}_{train_time}' 
     
-    criterion = torch.nn.CrossEntropyLoss() 
+    criterion = torch.nn.BCEWithLogitsLoss()
     
     if run_name is None:
         run_name = fw.generate(2, separator="_")
 
-    option_labels = [
-    torch.tensor([0, 0, 0, 0]).to(device),
-    torch.tensor([1, 0, 0, 0]).to(device),
-    torch.tensor([0, 1, 0, 0]).to(device),
-    torch.tensor([0, 0, 1, 0]).to(device),
-    torch.tensor([0, 0, 0, 1]).to(device),
-    torch.tensor([1, 0, 1, 0]).to(device),
-    torch.tensor([1, 0, 0, 1]).to(device),
-    torch.tensor([0, 1, 1, 0]).to(device),
-    torch.tensor([0, 1, 0, 1]).to(device),
-    ]
-    
-    options = [
-    "A. No.",
-    "B. Only face swap.",
-    "C. Only face attribute.",
-    "D. Only text swap.",
-    "E. Only text attribute.",
-    "F. Face swap and text swap.",
-    "G. Face swap and text attribute.",
-    "H. Face attribute and text swap.",
-    "I. Face attribute and text attribute.",
-    ]
-    
-    vectorizer = TfidfVectorizer().fit(options)
-    option_vectors = vectorizer.transform(options).toarray()
-    
     # Initialize wandb
     if rank == 0:  # Only initialize wandb in the main process
         wandb.init(project= logged_task_name, name=run_name)
@@ -410,7 +407,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
     # Load the model and processor
     model = AutoModelForCausalLM.from_pretrained(
-        AMD_init_pth, trust_remote_code=True, local_files_only=True
+        AMD_init_pth, trust_remote_code=True, local_files_only=True, ignore_mismatched_sizes=True
     ).to(device)
     processor = AutoProcessor.from_pretrained(
         AMD_init_pth, trust_remote_code=True, local_files_only=True
@@ -465,12 +462,10 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         # Training phase
         model.train()
         train_loss = 0
-        LLM_loss = 0
-        loss_list = []
         image_loss = 0
         text_loss = 0
         LT_loss = 0
-        loss_regular = 0
+        regular_loss_total = 0
         for batch in tqdm(
             train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}", position=rank
         ):
@@ -479,27 +474,15 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             # Prepare the input and target tensors
             input_ids = inputs["input_ids"].to(device)
             pixel_values = inputs["pixel_values"].to(device)
-            labels = processor.tokenizer(
-                text=answers,
-                return_tensors="pt",
-                padding=True,
-                return_token_type_ids=False,
-                truncation=True,
-                max_length=800,
-            ).input_ids.to(device)
-
             outputs = model(
-                input_ids=input_ids, pixel_values=pixel_values, labels=labels
+                input_ids=input_ids, pixel_values=pixel_values
             )
-            total_loss = outputs.loss
-            Binary_lables = []
-            for tt, label in enumerate(answers):
-                if label.startswith('A'):
-                    Binary_lables.append(1)  
-                else:
-                    Binary_lables.append(0)  
-                    
-            Binary_lables = torch.tensor(Binary_lables, dtype=torch.long).to(device)
+            total_loss = torch.tensor(0.0, device=device)
+            multi_labels = get_multi_label(answers, device)
+            temp_loss0 = torch.tensor(0.0, device=device)
+            temp_loss1 = torch.tensor(0.0, device=device)
+            temp_loss2 = torch.tensor(0.0, device=device)
+            reg_loss = torch.tensor(0.0, device=device)
 
             logits_list = outputs.classification_logits_list
             ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
@@ -507,41 +490,27 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             for i,logits in enumerate(logits_list):
                 if logits is not None:
                     if i == 0:
-                        temp_loss0 = criterion(logits,Binary_lables) 
+                        temp_loss0 = criterion(logits, multi_labels)
                         if torch.isnan(temp_loss0):
-                            raise RuntimeError(f"❌ logits_list[{i}] 产生 NaN，二分类损失 temp_loss0 为 NaN")
+                            raise RuntimeError(f"❌ logits_list[{i}] 多标签损失 temp_loss0 为 NaN")
                         total_loss += 0.1*temp_loss0 
-                        loss_list.append(temp_loss0)
                     if i == 1:
-                        temp_loss1 = criterion(logits,Binary_lables) 
+                        temp_loss1 = criterion(logits, multi_labels)
                         if torch.isnan(temp_loss1):
                             raise RuntimeError(f"❌ logits_list[{i}]  temp_loss1 = NaN")
                         total_loss += 0.1*temp_loss1 
-                        loss_list.append(temp_loss1)
                     if i == 2:
-                        temp_loss2 = criterion(logits,Binary_lables) 
+                        temp_loss2 = criterion(logits, multi_labels)
                         if torch.isnan(temp_loss2):
                             raise RuntimeError(f"❌ logits_list[{i}]  temp_loss2 = NaN")
                         total_loss += 0.1*temp_loss2 
-                        loss_list.append(temp_loss2)
-                        
-                    # if i == 3: ##output_coord (forgery localization disabled)
-                    #     output_coords = logits.to(device)
-                    #     tensor_fake_image_box = torch.cat(fake_image_box, dim=0).reshape(len(fake_image_box), -1).to(device)
-                    #     loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box) 
-                    #     if torch.isnan(loss_bbox):
-                    #         raise RuntimeError(f"❌ logits_list[{i}] loss_bbox = NaN")
-                    #     total_loss += 0.1*(loss_bbox+loss_giou) 
-                    #     loss_list.append(loss_bbox)
-                    #     loss_list.append(loss_giou)
                     
                     if i == 4: 
-                        loss_regular = logits.to(device)
-                        if torch.isnan(loss_regular):
+                        reg_loss = logits.to(device)
+                        if torch.isnan(reg_loss):
                             raise RuntimeError(f"❌ logits_list[{i}] loss_regular = NaN")
-                        loss_regular = regular_weight * loss_regular
-                        loss_list.append(loss_regular)
-                        total_loss += loss_regular
+                        reg_loss = regular_weight * reg_loss
+                        total_loss += reg_loss
 
     
             total_loss.backward()
@@ -551,51 +520,46 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             optimizer.zero_grad()
 
             train_loss += total_loss.item()
-            LLM_loss += outputs.loss.item()
-            image_loss += loss_list[0].item()
-            text_loss += loss_list[1].item()
-            LT_loss += loss_list[2].item()
-            loss_regular += loss_list[3].item()
+            image_loss += temp_loss0.item()
+            text_loss += temp_loss1.item()
+            LT_loss += temp_loss2.item()
+            regular_loss_total += reg_loss.item()
             
             
             
             if rank == 0:
                 if (global_step + 1) % 100 == 0:
                     print(f"  [Step {global_step+1}] "
-                          f"total={total_loss.item():.4f} LLM={outputs.loss.item():.4f} "
-                          f"img={loss_list[0].item():.4f} txt={loss_list[1].item():.4f} "
-                          f"LT={loss_list[2].item():.4f} reg={loss_list[3].item():.4f}")
+                          f"total={total_loss.item():.4f} "
+                          f"img={temp_loss0.item():.4f} txt={temp_loss1.item():.4f} "
+                          f"LT={temp_loss2.item():.4f} reg={reg_loss.item():.4f}")
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
-                wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
-                wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
-                wandb.log({"step": global_step + 1, "step_avg_text_loss": loss_list[1].item()})
-                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": loss_list[2].item()})
-                wandb.log({"step": global_step + 1, "step_avg_regular_loss": loss_list[3].item()})
-                
-            loss_list.clear()    
+                wandb.log({"step": global_step + 1, "step_avg_image_loss": temp_loss0.item()})
+                wandb.log({"step": global_step + 1, "step_avg_text_loss": temp_loss1.item()})
+                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": temp_loss2.item()})
+                wandb.log({"step": global_step + 1, "step_avg_regular_loss": reg_loss.item()})
+
             global_step += 1
 
             if global_step % eval_steps == 0:
-                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels)
+                evaluate_model(rank, world_size, model, val_loaders, device, global_step, max_val_item_count)
 
-        evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count,option_vectors,vectorizer,options,option_labels)
+        evaluate_model(rank, world_size, model, val_loaders, device, global_step, max_val_item_count)
 
         # Log training loss to wandb
         avg_train_loss = train_loss / len(train_loader)
-        avg_LLM_loss = LLM_loss / len(train_loader)
         avg_image_loss = image_loss / len(train_loader)
         avg_text_loss = text_loss / len(train_loader)
         avg_LT_loss = LT_loss / len(train_loader)
-        avg_regular_loss = loss_regular / len(train_loader)
+        avg_regular_loss = regular_loss_total / len(train_loader)
     
         
         if rank == 0:
             print(f"[Epoch {epoch+1}/{epochs}] "
-                  f"total_loss={avg_train_loss:.4f} LLM={avg_LLM_loss:.4f} "
+                  f"total_loss={avg_train_loss:.4f} "
                   f"image_cls={avg_image_loss:.4f} text_cls={avg_text_loss:.4f} "
                   f"LT_cls={avg_LT_loss:.4f} regular={avg_regular_loss:.4f}")
             wandb.log({"epoch": epoch + 1, "epoch_train_loss": avg_train_loss})
-            wandb.log({"epoch": epoch + 1, "epoch_avg_LLM_loss": avg_LLM_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_image_loss": avg_image_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_text_loss": avg_text_loss})
             wandb.log({"epoch": epoch + 1, "epoch_avg_LearnableToken_loss": avg_LT_loss})
@@ -629,7 +593,7 @@ def main():
     parser.add_argument("--eval-steps", type=int, default=2000, help="Number of steps between evaluations") 
     parser.add_argument("--run-name", type=str, default='test', help="Run name for wandb")
     parser.add_argument("--max-val-item-count", type=int, default=2000, help="Maximum number of items to evaluate on during validation")
-    parser.add_argument("--regular-weight", type=int, default=2000, help="loss weight of L_TRP")
+    parser.add_argument("--regular-weight", type=float, default=0.07, help="loss weight of L_TRP")
     parser.add_argument("--train-js", type=str, default='./train.json', help="json file for train")
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
