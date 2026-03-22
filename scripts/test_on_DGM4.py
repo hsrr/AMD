@@ -9,8 +9,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 from data import OriDGM4Dataset
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import roc_auc_score
 import numpy as np
 import sys, re
 from multilabel_metrics import AveragePrecisionMeter
@@ -19,63 +18,51 @@ import datetime
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def get_best_option(generated_texts, option_vectors,vectorizer,options,option_labels,device):
-    '''批量计算模型的输出对应哪一个选项
-    输入是生成的多个文本，和固定选项的向量表示
-    '''
-    # 将生成文本批量转换为向量
-    generated_vectors = vectorizer.transform(generated_texts).toarray()
+LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
 
-    # 计算相似度
-    similarities = cosine_similarity(generated_vectors, option_vectors)
-
-    # 获取每个生成文本的相似度最高的选项
-    best_option_indices = similarities.argmax(axis=1)
-
-    # 返回选项、相似度和对应的01标签
-    best_options = [options[i] for i in best_option_indices]
-    best_similarities = [similarities[i, best_option_indices[i]] for i in range(len(generated_texts))]
-
-    best_multi_labels = torch.stack([option_labels[i] for i in best_option_indices], dim=0)
-    # 对 best_multi_labels 进行归一化
-    # best_multi_labels_prob = F.softmax(best_multi_labels.float(), dim=1)
+def parse_generated_to_multilabel(generated_texts, device):
+    """Parse generated texts (A-E letter format) into multi-label [N,4] and binary labels."""
+    multi_label = torch.zeros(len(generated_texts), 4, dtype=torch.float32).to(device)
+    pred_label = torch.ones(len(generated_texts), dtype=torch.long).to(device)
     
-    #ori_pos，构造模型输出对应的单分类标签
-    pred_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
-    real_label_pos = np.where(np.array(best_options) == 'A. No.')[0].tolist()
-    # 是A. No.的地方设置为 0 --代表real图文
-    pred_label[real_label_pos] = 0
+    for i, text in enumerate(generated_texts):
+        clean = text.split('Manipulated')[0].split('Swapped')[0].strip()
+        clean = re.sub(r'[^A-E,\s]', '', clean).strip()
+        letters = [l.strip() for l in clean.split(',') if l.strip()]
+        
+        if not letters or letters == ['A']:
+            pred_label[i] = 0
+            continue
+        
+        has_valid = False
+        for letter in letters:
+            if letter in LETTER_TO_IDX:
+                multi_label[i, LETTER_TO_IDX[letter]] = 1.0
+                has_valid = True
+        if not has_valid:
+            pred_label[i] = 0
     
-    return best_options, best_similarities, best_multi_labels,pred_label
+    return multi_label, pred_label
 
-def get_multi_label(answers,device):
-    # 初始化 multi_label 矩阵
+def get_multi_label_from_vectors(vector_answers, device):
+    """Build multi_label [N,4] from pre-computed vector_answers."""
+    multi_label = torch.stack(list(vector_answers), dim=0).long().to(device)
+    real_label_pos = [i for i in range(len(vector_answers)) if vector_answers[i].sum().item() == 0]
+    return multi_label, real_label_pos
+
+def get_multi_label_from_text(answers, device):
+    """Parse answer text (new A-E format) into multi_label [N,4]."""
     multi_label = torch.zeros([len(answers), 4], dtype=torch.long).to(device)
-    
-    # 定义 real_label_pos（精确匹配 'A. No.'）
-    real_label_pos = [i for i, ans in enumerate(answers) if 'A. No.' in ans ]
-    multi_label[real_label_pos, :] = torch.tensor([0, 0, 0, 0]).to(device)
-    
-    # face_swap cls = [1, 0, 0, 0]（精确匹配 'B. Only face swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'B. Only face swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 0, 0]).to(device)
-    
-    # face_attribute cls = [0, 1, 0, 0]（精确匹配 'C. Only face attribute.'）
-    pos = [i for i, ans in enumerate(answers) if 'C. Only face attribute.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 0, 0]).to(device)
-    
-    # text_swap cls = [0, 0, 1, 0]（精确匹配 'D. Only text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'D. Only text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 0, 1, 0]).to(device)
-    
-    # face_swap&text_swap cls = [1, 0, 1, 0]（精确匹配 'E. Face swap and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'E. Face swap and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([1, 0, 1, 0]).to(device)
-    
-    # face_attribute&text_swap cls = [0, 1, 1, 0]（精确匹配 'F. Face attribute and text swap.'）
-    pos = [i for i, ans in enumerate(answers) if 'F. Face attribute and text swap.' in ans ]
-    multi_label[pos, :] = torch.tensor([0, 1, 1, 0]).to(device)
-    
+    real_label_pos = []
+    for i, ans in enumerate(answers):
+        clean = ans.split('Manipulated')[0].split('Swapped')[0].strip()
+        letters = [l.strip() for l in clean.split(',')]
+        if letters == ['A'] or clean == 'A':
+            real_label_pos.append(i)
+            continue
+        for letter in letters:
+            if letter in LETTER_TO_IDX:
+                multi_label[i, LETTER_TO_IDX[letter]] = 1
     return multi_label, real_label_pos
 
 
@@ -235,92 +222,84 @@ def compute_token_acc(captions, pre_words, fake_text_pos_list,tokenizer):
 
 
 
-def evaluate_model(test_loader, model, processor,device,option_vectors,vectorizer,options,option_labels,tokenizer):
+def evaluate_model(test_loader, model, processor, device, tokenizer):
 
-    IOU_pred = []
     token_acc_list = []
     cls_nums_all = 0
     cls_acc_all = 0  
-    val_item_count = 0 
+    val_item_count = 0
+    all_real_labels = []
+    all_pred_scores = []
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
-    for inputs, batch_answers,fake_text_pos_list,captions,fake_image_box in tqdm(test_loader, desc="Evaluating"):
+    for inputs, batch_answers, fake_text_pos_list, captions, fake_image_box, vector_answers in tqdm(test_loader, desc="Evaluating"):
         
-    
-        # generated_texts = run_batch(inputs)
         val_item_count += len(batch_answers)
-        ## model是DistributedDataParallel包装后的类，并没有generate方法，如需调用，应该使用model.module调用基础模型后再调用generate()方法
         generated_ids = model.generate(
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
             max_new_tokens=1024,
             num_beams=3,
         )
-        ###解析得到模型的文本输出
         generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
                 
         task_answers = []
-        pred_words_list = [] # 存储预测的假单词
-        output_coords = torch.zeros((len(generated_texts), 4)).to(device)
-        true_coords = torch.zeros((len(generated_texts), 4)).to(device)
-        
+        pred_words_list = []
         
         for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
-
             full_answer = re.sub(r"<pad>|<s>|</s>", "", generated_text)
-            pre_words = [] # 初始化pre_words
-            ## 如果在返回中有Swapped words:，先拿出来备用
+            pre_words = []
             if 'Swapped words:' in full_answer:
                 pre_words = full_answer.split('Swapped words:')[-1]
                 full_answer = full_answer.split('Swapped words:')[0]
             
             if '<loc_' in full_answer:
                 task_answers.append(full_answer.split('Manipulated face')[0])
-                output_coords[i] = parse_coordinates(full_answer).to(device)
-                true_coords[i] = parse_coordinates(answers).to(device)
-            # 将 output_coord 堆叠到 output_coords中
             else:
                 task_answers.append(full_answer)
-                true_coords[i] = parse_coordinates(answers).to(device)
             
             pred_words_list.append(pre_words)
-                
-        
-                
-        real_multi_label, real_label_pos = get_multi_label(batch_answers,device)
+
+        real_multi_label, real_label_pos = get_multi_label_from_vectors(vector_answers, device)
         real_label = torch.ones(len(generated_texts), dtype=torch.long).to(device) 
         real_label[real_label_pos] = 0
-        best_options, _ ,best_multi_labels,pred_label =  get_best_option(task_answers, option_vectors,vectorizer,options,option_labels,device)
         
-        ##--reeal/fake---##
+        pred_multi_label, pred_label = parse_generated_to_multilabel(task_answers, device)
+        
+        ##--real/fake---##
         cls_nums_all = val_item_count
         cls_acc_all += torch.sum(real_label == pred_label).item()
         
-        IOU, _ = box_iou(output_coords, true_coords.to(device), test=True)
-
-        # IOU_pred.extend(IOU.cpu().tolist())
-        for iou_value in IOU.cpu().tolist():
-            if isinstance(iou_value, (int, float)) and not math.isnan(iou_value) and not math.isinf(iou_value):
-                IOU_pred.append(iou_value)
-            else:
-                IOU_pred.append(0.0)
-        ######################################3
+        all_real_labels.extend(real_label.cpu().tolist())
+        all_pred_scores.extend(pred_label.cpu().float().tolist())
 
         ##-multi--##
-        multi_label_meter.add(best_multi_labels, real_multi_label)
+        multi_label_meter.add(pred_multi_label, real_multi_label)
         ## token-acc ##
-        token_acc_list.append(compute_token_acc(captions,pred_words_list,fake_text_pos_list,tokenizer))
-        
+        token_acc_list.append(compute_token_acc(captions, pred_words_list, fake_text_pos_list, tokenizer))
 
-    IOU_score = sum(IOU_pred)/len(IOU_pred)
-    Token_ACC = sum(token_acc_list)/len(token_acc_list)
+    Token_ACC = sum(token_acc_list)/len(token_acc_list) if token_acc_list else 0.0
     ACC_cls = cls_acc_all / cls_nums_all
     
-    MAP = multi_label_meter.value()[:3].mean()
-    
+    ap_values = multi_label_meter.value()
+    MAP = ap_values.mean() if isinstance(ap_values, torch.Tensor) and ap_values.numel() > 0 else 0.0
 
-    return ACC_cls, cls_acc_all, cls_nums_all,IOU_score,MAP,Token_ACC
+    AUC = 0.0
+    try:
+        from sklearn.metrics import roc_auc_score
+        if len(set(all_real_labels)) > 1:
+            AUC = roc_auc_score(all_real_labels, all_pred_scores)
+    except Exception:
+        AUC = 0.0
+
+    OP, OR, OF1, CP, CR, CF1 = 0, 0, 0, 0, 0, 0
+    try:
+        OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
+    except Exception:
+        pass
+
+    return ACC_cls, cls_acc_all, cls_nums_all, MAP, Token_ACC, AUC, OP, OR, OF1, CP, CR, CF1
 
 
 def main():
@@ -341,27 +320,6 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    # Fixed options & vectorizer
-    options = [
-        "A. No.",
-        "B. Only face swap.",
-        "C. Only face attribute.",
-        "D. Only text swap.",
-        "E. Face swap and text swap.",
-        "F. Face attribute and text swap.",
-    ]
-    
-    option_labels = [
-    torch.tensor([0, 0, 0, 0]).to(device),
-    torch.tensor([1, -0.33, -0.33, -0.33]).to(device),
-    torch.tensor([-0.33, 1, -0.33, -0.33]).to(device),
-    torch.tensor([-0.33, -0.33, 1, -0.33]).to(device),
-    torch.tensor([0.5, -0.5, 0.5, -0.5]).to(device),
-    torch.tensor([-0.5, 0.5, 0.5, -0.5]).to(device),
-    ]
-    vectorizer = TfidfVectorizer().fit(options)
-    option_vectors = vectorizer.transform(options).toarray()
-
     # Logging setup
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
@@ -373,12 +331,10 @@ def main():
             print(*args_, **kwargs_, file=flog)
     
     def collate_fn(batch):
-
-        #### DGM4的定义：
-        images, questions, answers, fake_words_lists, captions,fake_image_box = zip(*batch)
+        images, questions, answers, fake_words_lists, captions, fake_image_box, vector_answers = zip(*batch)
         
         inputs = processor(text=list(questions), images=list(images), return_tensors="pt", padding=True).to(device)
-        return inputs, answers,fake_words_lists,captions,fake_image_box
+        return inputs, answers, fake_words_lists, captions, fake_image_box, vector_answers
 
     log_print(f"test model_id is {args.model_id}")
 
@@ -395,13 +351,19 @@ def main():
             prefetch_factor=None,
         )
 
-        ACC_cls, cls_acc_all, cls_nums_all, MAP, IOU_score, Token_ACC = evaluate_model(test_loader,model,processor,device,option_vectors,vectorizer,options,option_labels,tokenizer)
+        ACC_cls, cls_acc_all, cls_nums_all, MAP, Token_ACC, AUC, OP, OR, OF1, CP, CR, CF1 = evaluate_model(test_loader, model, processor, device, tokenizer)
 
         log_print('#######<--record-->###########')
-        log_print(f"ACC_cls (Accuracy): {ACC_cls*100} (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
-        log_print(f"MAP (Mean Average Precision): {MAP*100}")
-        log_print(f"IoUscore: {IOU_score*100}")
-        log_print(f"Token_Acc: {Token_ACC*100}")
+        log_print(f"ACC_cls (Accuracy): {ACC_cls*100:.2f} (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
+        log_print(f"AUC (Binary): {AUC*100:.2f}")
+        log_print(f"MAP (Mean Average Precision): {MAP*100:.2f}")
+        log_print(f"Token_Acc: {Token_ACC*100:.2f}")
+        log_print(f"Overall Precision (OP): {OP:.4f}")
+        log_print(f"Overall Recall (OR): {OR:.4f}")
+        log_print(f"Overall F1 (OF1): {OF1:.4f}")
+        log_print(f"Class Precision (CP): {CP:.4f}")
+        log_print(f"Class Recall (CR): {CR:.4f}")
+        log_print(f"Class F1 (CF1): {CF1:.4f}")
         log_print('########<--record-->#########')
         log_print("END############################################################################################")
 

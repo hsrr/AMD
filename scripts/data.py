@@ -42,6 +42,110 @@ face_text_locate = "If there is manipulation of a face, locate the most likely m
 
 describe_ques_latter_OB = ". The identity and emotion of the face, and the semantic and sentiment of the text should not be manipulated. Question: Is there any fake face or fake words in the news?\nA. No.\nB. Yes.\nThe options is:"
 
+# =================== New 9-class multi-label constants ===================
+MANIPULATION_TYPES = ['face_swap', 'face_attribute', 'text_swap', 'text_attribute']
+TYPE_TO_LETTER = {
+    'face_swap': 'B',
+    'face_attribute': 'C',
+    'text_swap': 'D',
+    'text_attribute': 'E',
+}
+TYPE_TO_CLASS_ID = {
+    'face_swap': 1,
+    'face_attribute': 2,
+    'text_swap': 3,
+    'text_attribute': 4,
+}
+
+TASK_TEMPLATES = """You are a forensic expert specializing in multi-modal fake news detection. Your core task is to analyze the provided News Image and Caption to identify any manipulation by evaluating their semantic consistency.
+
+News Caption: {}
+
+Analyze the content based on the following 5 categories and select ALL applicable option letters.
+
+Options:
+A. Real News:
+   Both the image and text are authentic and semantically consistent, with no artificial manipulation traces.
+
+B. Face Swap (FS - Image Manipulation):
+   The identity of the main character is attacked by swapping their face with another person's features. Look for identity inconsistency and visual artifacts like blurring or mismatched skin tones.
+
+C. Face Attribute (FA - Image Manipulation):
+   The character's identity is preserved, but their facial expression or emotion has been modified by AI (e.g., changing a smile to anger or dejection). Check if the facial emotion contradicts the news context.
+
+D. Text Swap (TS - Text Manipulation):
+   The person's name (entity) is preserved, but the overall news semantic is replaced with an unrelated event. Identify if the described actions or locations result in an "out-of-context" mismatch with the visual scene.
+
+E. Text Attribute (TA - Text Manipulation):
+   Specific sentiment words or biases are modified to the opposite emotion (e.g., changing positive words to "forced", "resign", or "mourn"). Check if the caption's sentiment directly contradicts the character's expression or the atmosphere in the image.
+
+Instructions:
+- If the news is authentic, output ONLY: A
+- If manipulation exists, output the letters of ALL detected types, separated by commas (e.g., "B, D" or "B").
+- DO NOT explain your reasoning. Output ONLY the option letters.
+
+Answer:"""
+
+
+def parse_label_to_answer(cls_key):
+    """
+    Convert label key to answer string and 4-element multi-label vector.
+    Canonical ordering ensures consistent Teacher Forcing targets.
+    """
+    if cls_key in ['orig', 'real', 'original']:
+        return "A", torch.zeros(4, dtype=torch.float32)
+
+    parts = cls_key.split('&')
+    valid_types = []
+
+    for p in parts:
+        if p == 'infoswap': p = 'text_swap'
+        if p in MANIPULATION_TYPES:
+            valid_types.append(p)
+
+    valid_types.sort(key=lambda x: MANIPULATION_TYPES.index(x))
+
+    if not valid_types:
+        return "A", torch.zeros(4, dtype=torch.float32)
+
+    letters = [TYPE_TO_LETTER[t] for t in valid_types]
+    text_answer = ", ".join(letters)
+
+    vector_answer = torch.zeros(4, dtype=torch.float32)
+    for t in valid_types:
+        idx = MANIPULATION_TYPES.index(t)
+        vector_answer[idx] = 1.0
+
+    return text_answer, vector_answer
+
+
+def parse_label_to_class5(cls_key):
+    """
+    5-class soft label distribution: [A, B, C, D, E]
+    For co-occurrence, probability is split among active fake types.
+    """
+    target = torch.zeros(5, dtype=torch.float32)
+    if cls_key in ['orig', 'real', 'original']:
+        target[0] = 1.0
+        return target
+
+    parts = cls_key.split('&')
+    valid_types = []
+    for p in parts:
+        if p == 'infoswap':
+            p = 'text_swap'
+        if p in MANIPULATION_TYPES:
+            valid_types.append(p)
+
+    valid_types = sorted(set(valid_types), key=lambda x: MANIPULATION_TYPES.index(x))
+    if len(valid_types) == 0:
+        target[0] = 1.0
+        return target
+    prob = 1.0 / float(len(valid_types))
+    for t in valid_types:
+        target[TYPE_TO_CLASS_ID[t]] = prob
+    return target
+
 
 
 
@@ -192,13 +296,12 @@ class DGM4_Dataset(Dataset):
         #     {"from": "human", "value": describe_temple + caption + describe_ques_latter})
         # conversation.append({"from": "gpt", "value": describles_answ[label]})
         
-        question = '<DGM4>'+describe_temple + caption + describe_ques_latter + face_locate
-        answer = describles_answ[label]
-        
+        question = '<DGM4>' + TASK_TEMPLATES.format(caption)
+        text_answer, vector_answer = parse_label_to_answer(label)
+        answer = text_answer
+
         if has_bbox:
-            ## florence2返回的坐标是xyxy格式的 x1,y1,x2,y2 = 365.4,465.2,765.8,999.6
             x1,y1,x2,y2 = self.denormalize_fake_image_box_xyxy(fake_image_box,W,H)
-            # 保留两位小数，并插入到字符串模板中
             face_bbox_answer = (
                 "Manipulated face"
                 + f"<loc_{int(x1)}>"
@@ -207,10 +310,8 @@ class DGM4_Dataset(Dataset):
                 + f"<loc_{int(y2)}>"
             )
             answer += face_bbox_answer
-        # conversation = '<DGM4>'+conversation
-        # mask是根据边界框生成一个与目标分辨率 (self.image_res) 相同大小的掩码（mask），对应的区域被赋值为 1，其余为 0。
-        # return image, question, answer,label, caption, fake_image_box, fake_text_pos_list, W, H, mask
-        return image, question, answer,fake_image_box
+
+        return image, question, answer, fake_image_box, vector_answer
 
 ###########################
 
@@ -378,13 +479,12 @@ class OriDGM4Dataset(Dataset):
 
 
         
-        question = '<DGM4>'+describe_temple + caption + describe_ques_latter + face_text_locate
-        answer = describles_answ[label]
-        
+        question = '<DGM4>' + TASK_TEMPLATES.format(caption)
+        text_answer, vector_answer = parse_label_to_answer(label)
+        answer = text_answer
+
         if has_bbox:
-            ## florence2返回的坐标是xyxy格式的 x1,y1,x2,y2 = 365.4,465.2,765.8,999.6
             x1,y1,x2,y2 = self.denormalize_fake_image_box_xyxy(fake_image_box,W,H)
-            # 保留两位小数，并插入到字符串模板中
             face_bbox_answer = (
                 "Manipulated face"
                 + f"<loc_{int(x1)}>"
@@ -396,9 +496,8 @@ class OriDGM4Dataset(Dataset):
             answer += face_bbox_answer
         if len(fake_text_pos)>0:
             answer += self.extract_swapped_words(caption,fake_text_pos)
-            
-            ## 图像，问题，答案，fake word的[01]编码
-        return image, question, answer,fake_text_pos_list,caption,fake_image_box
+
+        return image, question, answer, fake_text_pos_list, caption, fake_image_box, vector_answer
 
 ###########################
 
