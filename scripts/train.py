@@ -160,11 +160,16 @@ def create_data_loaders(
     return train_loader, val_loaders
 
 LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
-A_TOKEN_ID = 250
-MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
 
 
-def extract_scores_from_logits(lm_logits):
+def get_letter_token_ids(tokenizer):
+    """Dynamically resolve token IDs for A/B/C/D/E from the tokenizer."""
+    a_id = tokenizer.convert_tokens_to_ids('A')
+    multi_ids = [tokenizer.convert_tokens_to_ids(c) for c in ['B', 'C', 'D', 'E']]
+    return a_id, multi_ids
+
+
+def extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids):
     """Extract all continuous scores from the decoder LM logits.
 
     Returns:
@@ -173,10 +178,10 @@ def extract_scores_from_logits(lm_logits):
     """
     probs = F.softmax(lm_logits, dim=-1)
 
-    p_a = probs[:, 0, A_TOKEN_ID]
+    p_a = probs[:, 0, a_token_id]
     binary_scores = 1.0 - p_a
 
-    token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
+    token_ids = torch.tensor(multi_label_token_ids, device=probs.device)
     letter_probs = probs[:, :, token_ids]
     multilabel_scores, _ = letter_probs.max(dim=1)
 
@@ -268,7 +273,7 @@ def parse_coordinates(text):
         return torch.tensor([[0, 0, 0, 0]])
 
 
-def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count):
+def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids):
 
     model.eval()
     with torch.no_grad():
@@ -301,7 +306,7 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 )
 
                 lm_logits = outputs.logits
-                binary_score, multilabel_scores = extract_scores_from_logits(lm_logits)
+                binary_score, multilabel_scores = extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids)
 
                 generated_ids = model.module.generate(
                     input_ids=input_ids,
@@ -447,7 +452,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
     processor = AutoProcessor.from_pretrained(
         AMD_init_pth, trust_remote_code=True
     )
-    
+
+    a_token_id, multi_label_token_ids = get_letter_token_ids(processor.tokenizer)
 
     if use_lora:
         TARGET_MODULES = [
@@ -601,9 +607,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             global_step += 1
 
             if global_step % eval_steps == 0:
-                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count)
+                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
 
-        evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count)
+        evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
 
         # Log training loss to wandb
         avg_train_loss = train_loss / len(train_loader)

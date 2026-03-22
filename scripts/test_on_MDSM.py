@@ -20,11 +20,16 @@ import time
 
 
 LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
-A_TOKEN_ID = 250
-MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
 
 
-def extract_scores_from_logits(lm_logits):
+def get_letter_token_ids(tokenizer):
+    """Dynamically resolve token IDs for A/B/C/D/E from the tokenizer."""
+    a_id = tokenizer.convert_tokens_to_ids('A')
+    multi_ids = [tokenizer.convert_tokens_to_ids(c) for c in ['B', 'C', 'D', 'E']]
+    return a_id, multi_ids
+
+
+def extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids):
     """Extract all continuous scores from the decoder LM logits (main backbone).
 
     Returns:
@@ -33,10 +38,10 @@ def extract_scores_from_logits(lm_logits):
     """
     probs = F.softmax(lm_logits, dim=-1)
 
-    p_a = probs[:, 0, A_TOKEN_ID]
+    p_a = probs[:, 0, a_token_id]
     binary_scores = 1.0 - p_a
 
-    token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
+    token_ids = torch.tensor(multi_label_token_ids, device=probs.device)
     letter_probs = probs[:, :, token_ids]
     multilabel_scores, _ = letter_probs.max(dim=1)
 
@@ -158,7 +163,7 @@ def parse_coordinates(text):
         # print('没有match')
         return torch.tensor([[0, 0, 0, 0]])
 
-def evaluate_model(test_loader, model, processer, device):
+def evaluate_model(test_loader, model, processer, device, a_token_id, multi_label_token_ids):
 
     cls_nums_all = 0
     cls_acc_all = 0   
@@ -187,7 +192,7 @@ def evaluate_model(test_loader, model, processer, device):
             )
 
         lm_logits = outputs.logits
-        binary_score, multilabel_scores = extract_scores_from_logits(lm_logits)
+        binary_score, multilabel_scores = extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids)
 
         generated_texts = run_batch(inputs, model, processer)
         task_answers = []
@@ -254,6 +259,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model_id, trust_remote_code=True).eval().to(device)
     processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
 
+    a_token_id, multi_label_token_ids = get_letter_token_ids(processor.tokenizer)
+
     # Prepare output file path
     output_file = args.output_file or os.path.join(args.model_id, f"domain_test_out_{timestamp}.txt")
 
@@ -297,7 +304,7 @@ def main():
         )
 
         # Evaluate
-        ACC_cls, cls_acc_all, cls_nums_all, MAP, OP, OR, OF1, CP, CR, CF1, AUC = evaluate_model(test_loader, model, processor, device)
+        ACC_cls, cls_acc_all, cls_nums_all, MAP, OP, OR, OF1, CP, CR, CF1, AUC = evaluate_model(test_loader, model, processor, device, a_token_id, multi_label_token_ids)
 
         log_print('#######<--record-->###########')
         log_print(f"binary_acc={ACC_cls*100:.2f}% (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
