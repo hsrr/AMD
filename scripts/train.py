@@ -169,23 +169,28 @@ def get_letter_token_ids(tokenizer):
     return a_id, multi_ids
 
 
-def extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids):
-    """Extract all continuous scores from the decoder LM logits.
+def extract_multilabel_scores_from_generate(scores, multi_label_token_ids, device, batch_size, num_beams=1):
+    """Extract generation-time multilabel scores using step-wise max pooling.
 
-    Returns:
-        binary_scores: [N] — P(fake) = 1 - P(A) at position 0.
-        multilabel_scores: [N,4] — max P(B/C/D/E) across all positions.
+    For each sample and each label token in {B,C,D,E}, compute the maximum
+    closed-set probability across all generation steps (and beams, if used).
     """
-    probs = F.softmax(lm_logits, dim=-1)
+    if scores is None or len(scores) == 0:
+        return None
 
-    p_a = probs[:, 0, a_token_id]
-    binary_scores = 1.0 - p_a
+    all_logits = torch.stack(scores, dim=0).to(device)  # (n_steps, batch_or_beam_batch, vocab)
+    token_ids = torch.tensor(multi_label_token_ids, device=all_logits.device)
+    target_logits = all_logits[:, :, token_ids]  # (n_steps, batch_or_beam_batch, 4)
+    target_probs = F.softmax(target_logits, dim=-1)
 
-    token_ids = torch.tensor(multi_label_token_ids, device=probs.device)
-    letter_probs = probs[:, :, token_ids]
-    multilabel_scores, _ = letter_probs.max(dim=1)
+    beam_batch = target_probs.size(1)
+    if num_beams > 1 and beam_batch == batch_size * num_beams:
+        target_probs = target_probs.view(target_probs.size(0), batch_size, num_beams, 4).max(dim=2).values
+    elif beam_batch != batch_size:
+        target_probs = target_probs[:, :batch_size, :]
 
-    return binary_scores, multilabel_scores
+    multilabel_scores = target_probs.max(dim=0).values  # (batch_size, 4)
+    return multilabel_scores
 
 def get_multi_label_from_vectors(vector_answers, device):
     """Build multi_label [N,4] from pre-computed vector_answers and determine real_label positions."""
@@ -301,20 +306,28 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                     max_length=800,
                 ).input_ids.to(device)
 
-                outputs = model.module(
-                    input_ids=input_ids, pixel_values=pixel_values, labels=labels
-                )
-
-                lm_logits = outputs.logits
-                binary_score, multilabel_scores = extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids)
-
-                generated_ids = model.module.generate(
+                binary_score = None
+                generate_outputs = model.module.generate(
                     input_ids=input_ids,
                     pixel_values=pixel_values,
                     max_new_tokens=1024,
                     num_beams=3,
+                    output_scores=True,
+                    return_dict_in_generate=True,
                 )
+                generated_ids = generate_outputs.sequences
                 generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
+
+                if hasattr(generate_outputs, "scores"):
+                    multilabel_scores = extract_multilabel_scores_from_generate(
+                        generate_outputs.scores,
+                        multi_label_token_ids,
+                        device,
+                        batch_size=len(generated_texts),
+                        num_beams=3,
+                    )
+                else:
+                    multilabel_scores = None
                 
                 task_answers = []
                 for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
@@ -334,9 +347,18 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 cls_acc_all += torch.sum(real_label == pred_label).item()
                 
                 all_binary_gt.extend(real_label.cpu().tolist())
-                all_binary_scores.extend(binary_score.cpu().tolist())
+                if binary_score is not None:
+                    all_binary_scores.extend(binary_score.cpu().tolist())
+                elif multilabel_scores is not None:
+                    max_fake_prob = multilabel_scores.max(dim=1).values
+                    all_binary_scores.extend(max_fake_prob.cpu().tolist())
+                else:
+                    all_binary_scores.extend(pred_label.cpu().float().tolist())
 
-                multi_label_meter.add(multilabel_scores, real_multi_label)
+                if multilabel_scores is not None:
+                    multi_label_meter.add(multilabel_scores, real_multi_label)
+                else:
+                    multi_label_meter.add(pred_multi_label, real_multi_label)
 
                 if val_item_count > max_val_item_count:
                     break
