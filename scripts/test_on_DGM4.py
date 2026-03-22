@@ -228,17 +228,42 @@ def evaluate_model(test_loader, model, processor, device, tokenizer):
     cls_nums_all = 0
     cls_acc_all = 0  
     val_item_count = 0
-    all_real_labels = []
-    all_pred_scores = []
+    all_binary_gt = []
+    all_binary_scores = []
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
 
     for inputs, batch_answers, fake_text_pos_list, captions, fake_image_box, vector_answers in tqdm(test_loader, desc="Evaluating"):
         
         val_item_count += len(batch_answers)
+
+        input_ids = inputs["input_ids"].to(device)
+        pixel_values = inputs["pixel_values"].to(device)
+
+        labels = processor.tokenizer(
+            text=batch_answers,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+            truncation=True,
+            max_length=800,
+        ).input_ids.to(device)
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids, pixel_values=pixel_values, labels=labels
+            )
+        logits_list = outputs.classification_logits_list
+
+        binary_score = None
+        if logits_list is not None and logits_list[2] is not None:
+            binary_logits = logits_list[2]
+            binary_prob = F.softmax(binary_logits, dim=1)
+            binary_score = binary_prob[:, 0]
+
         generated_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
+            input_ids=input_ids,
+            pixel_values=pixel_values,
             max_new_tokens=1024,
             num_beams=3,
         )
@@ -267,29 +292,28 @@ def evaluate_model(test_loader, model, processor, device, tokenizer):
         
         pred_multi_label, pred_label = parse_generated_to_multilabel(task_answers, device)
         
-        ##--real/fake---##
         cls_nums_all = val_item_count
         cls_acc_all += torch.sum(real_label == pred_label).item()
         
-        all_real_labels.extend(real_label.cpu().tolist())
-        all_pred_scores.extend(pred_label.cpu().float().tolist())
+        all_binary_gt.extend(real_label.cpu().tolist())
+        if binary_score is not None:
+            all_binary_scores.extend(binary_score.cpu().tolist())
+        else:
+            all_binary_scores.extend(pred_label.cpu().float().tolist())
 
-        ##-multi--##
         multi_label_meter.add(pred_multi_label, real_multi_label)
-        ## token-acc ##
         token_acc_list.append(compute_token_acc(captions, pred_words_list, fake_text_pos_list, tokenizer))
 
     Token_ACC = sum(token_acc_list)/len(token_acc_list) if token_acc_list else 0.0
-    ACC_cls = cls_acc_all / cls_nums_all
+    ACC_cls = cls_acc_all / cls_nums_all if cls_nums_all > 0 else 0.0
     
     ap_values = multi_label_meter.value()
     MAP = ap_values.mean() if isinstance(ap_values, torch.Tensor) and ap_values.numel() > 0 else 0.0
 
     AUC = 0.0
     try:
-        from sklearn.metrics import roc_auc_score
-        if len(set(all_real_labels)) > 1:
-            AUC = roc_auc_score(all_real_labels, all_pred_scores)
+        if len(set(all_binary_gt)) > 1:
+            AUC = roc_auc_score(all_binary_gt, all_binary_scores)
     except Exception:
         AUC = 0.0
 
@@ -354,16 +378,13 @@ def main():
         ACC_cls, cls_acc_all, cls_nums_all, MAP, Token_ACC, AUC, OP, OR, OF1, CP, CR, CF1 = evaluate_model(test_loader, model, processor, device, tokenizer)
 
         log_print('#######<--record-->###########')
-        log_print(f"ACC_cls (Accuracy): {ACC_cls*100:.2f} (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
-        log_print(f"AUC (Binary): {AUC*100:.2f}")
-        log_print(f"MAP (Mean Average Precision): {MAP*100:.2f}")
-        log_print(f"Token_Acc: {Token_ACC*100:.2f}")
-        log_print(f"Overall Precision (OP): {OP:.4f}")
-        log_print(f"Overall Recall (OR): {OR:.4f}")
-        log_print(f"Overall F1 (OF1): {OF1:.4f}")
-        log_print(f"Class Precision (CP): {CP:.4f}")
-        log_print(f"Class Recall (CR): {CR:.4f}")
-        log_print(f"Class F1 (CF1): {CF1:.4f}")
+        log_print(f"binary_acc={ACC_cls*100:.2f}% (cls_acc_all: {cls_acc_all}, cls_nums_all: {cls_nums_all})")
+        log_print(f"binary_auc={AUC:.4f}")
+        log_print(f"mAP={MAP:.4f}")
+        log_print(f"CF1={CF1:.4f}")
+        log_print(f"Token_Acc={Token_ACC*100:.2f}%")
+        log_print(f"OP={OP:.4f}, OR={OR:.4f}, OF1={OF1:.4f}")
+        log_print(f"CP={CP:.4f}, CR={CR:.4f}")
         log_print('########<--record-->#########')
         log_print("END############################################################################################")
 

@@ -249,30 +249,52 @@ def parse_coordinates(text):
 
 def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count):
 
-    # Evaluation phase
     model.eval()
     with torch.no_grad():
         for val_name, val_loader in val_loaders.items():
             val_item_count = 0
             cls_nums_all = 0
             cls_acc_all = 0 
-            all_real_labels = []
-            all_pred_scores = []
+            all_binary_gt = []
+            all_binary_scores = []
             multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
             multi_label_meter.reset()
             for batch in tqdm(val_loader, desc=f"Evaluation on {val_name} at step {global_step}", position=rank):
                 inputs, batch_answers, fake_image_box, vector_answers = batch
                 val_item_count += len(batch_answers)
+
+                input_ids = inputs["input_ids"].to(device)
+                pixel_values = inputs["pixel_values"].to(device)
+
+                labels = processor.tokenizer(
+                    text=batch_answers,
+                    return_tensors="pt",
+                    padding=True,
+                    return_token_type_ids=False,
+                    truncation=True,
+                    max_length=800,
+                ).input_ids.to(device)
+
+                outputs = model.module(
+                    input_ids=input_ids, pixel_values=pixel_values, labels=labels
+                )
+                logits_list = outputs.classification_logits_list
+
+                binary_score = None
+                if logits_list is not None and logits_list[2] is not None:
+                    binary_logits = logits_list[2]
+                    binary_prob = F.softmax(binary_logits, dim=1)
+                    binary_score = binary_prob[:, 0]
+
                 generated_ids = model.module.generate(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
                     max_new_tokens=1024,
                     num_beams=3,
                 )
                 generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
                 
                 task_answers = []
-                
                 for i, (generated_text, answers) in enumerate(zip(generated_texts, batch_answers)):
                     full_answer = re.sub(r"<pad>|<s>|</s>", "", generated_text)
                     if '<loc_' in full_answer:
@@ -286,30 +308,31 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 
                 pred_multi_label, pred_label, _ = parse_generated_to_multilabel(task_answers, device)
                 
-                ##--real/fake---##
                 cls_nums_all = val_item_count
                 cls_acc_all += torch.sum(real_label == pred_label).item()
                 
-                all_real_labels.extend(real_label.cpu().tolist())
-                all_pred_scores.extend(pred_label.cpu().float().tolist())
-                            
-                ##-multi--##
+                all_binary_gt.extend(real_label.cpu().tolist())
+                if binary_score is not None:
+                    all_binary_scores.extend(binary_score.cpu().tolist())
+                else:
+                    all_binary_scores.extend(pred_label.cpu().float().tolist())
+
                 multi_label_meter.add(pred_multi_label, real_multi_label)
-                
-                local_ACC_cls = cls_acc_all / cls_nums_all
-                ap_values = multi_label_meter.value()
-                local_MAP = ap_values.mean().item() if isinstance(ap_values, torch.Tensor) and ap_values.numel() > 0 else 0.0
 
                 if val_item_count > max_val_item_count:
                     break
 
+        local_ACC_cls = cls_acc_all / cls_nums_all if cls_nums_all > 0 else 0.0
+
         local_AUC = 0.0
         try:
-            from sklearn.metrics import roc_auc_score
-            if len(set(all_real_labels)) > 1:
-                local_AUC = roc_auc_score(all_real_labels, all_pred_scores)
+            if len(set(all_binary_gt)) > 1:
+                local_AUC = roc_auc_score(all_binary_gt, all_binary_scores)
         except Exception:
             local_AUC = 0.0
+
+        ap_values = multi_label_meter.value()
+        local_MAP = ap_values.mean().item() if isinstance(ap_values, torch.Tensor) and ap_values.numel() > 0 else 0.0
 
         local_CF1 = 0.0
         try:
@@ -328,11 +351,11 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
         CF1 = synchronize_metrics(local_CF1_tensor, world_size)
 
         if dist.get_rank() == 0:
-            print(f"Rank {rank} - Step {global_step} - ACC ({val_name}): {ACC_cls.item():.4f}, AUC: {AUC.item():.4f}, MAP: {MAP.item():.4f}, CF1: {CF1.item():.4f}")
+            print(f"Rank {rank} - Step {global_step} - binary_acc={ACC_cls.item():.4f}, binary_auc={AUC.item():.4f}, mAP={MAP.item():.4f}, CF1={CF1.item():.4f}")
             wandb.log({
-                f"{val_name}_ACC_cls": ACC_cls.item(),
-                f"{val_name}_AUC": AUC.item(),
-                f"{val_name}_MAP": MAP.item(),
+                f"{val_name}_binary_acc": ACC_cls.item(),
+                f"{val_name}_binary_auc": AUC.item(),
+                f"{val_name}_mAP": MAP.item(),
                 f"{val_name}_CF1": CF1.item(),
                 "step": global_step
             })
