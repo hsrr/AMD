@@ -19,21 +19,27 @@ timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
+A_TOKEN_ID = 250
 MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
 
 
-def extract_multilabel_scores_from_logits(lm_logits):
-    """Extract continuous [N,4] scores for B/C/D/E from decoder logits.
+def extract_scores_from_logits(lm_logits):
+    """Extract all continuous scores from the decoder LM logits (main backbone).
 
-    Max-pool across all decoder positions so that each letter's score
-    reflects its highest probability at any position (handles multi-label
-    answers like "B, D" where D appears at a later position).
+    Returns:
+        binary_scores: [N] — P(fake) = 1 - P(A) at position 0.
+        multilabel_scores: [N,4] — max P(B/C/D/E) across all positions.
     """
     probs = F.softmax(lm_logits, dim=-1)
+
+    p_a = probs[:, 0, A_TOKEN_ID]
+    binary_scores = 1.0 - p_a
+
     token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
     letter_probs = probs[:, :, token_ids]
-    scores, _ = letter_probs.max(dim=1)
-    return scores
+    multilabel_scores, _ = letter_probs.max(dim=1)
+
+    return binary_scores, multilabel_scores
 
 
 def parse_generated_to_multilabel(generated_texts, device):
@@ -269,18 +275,9 @@ def evaluate_model(test_loader, model, processor, device, tokenizer):
             outputs = model(
                 input_ids=input_ids, pixel_values=pixel_values, labels=labels
             )
-        logits_list = outputs.classification_logits_list
-
-        binary_score = None
-        multilabel_scores = None
-        if logits_list is not None and logits_list[2] is not None:
-            binary_logits = logits_list[2]
-            binary_prob = F.softmax(binary_logits, dim=1)
-            binary_score = binary_prob[:, 0]
 
         lm_logits = outputs.logits
-        if lm_logits is not None:
-            multilabel_scores = extract_multilabel_scores_from_logits(lm_logits)
+        binary_score, multilabel_scores = extract_scores_from_logits(lm_logits)
 
         generated_ids = model.generate(
             input_ids=input_ids,
@@ -317,15 +314,9 @@ def evaluate_model(test_loader, model, processor, device, tokenizer):
         cls_acc_all += torch.sum(real_label == pred_label).item()
         
         all_binary_gt.extend(real_label.cpu().tolist())
-        if binary_score is not None:
-            all_binary_scores.extend(binary_score.cpu().tolist())
-        else:
-            all_binary_scores.extend(pred_label.cpu().float().tolist())
+        all_binary_scores.extend(binary_score.cpu().tolist())
 
-        if multilabel_scores is not None:
-            multi_label_meter.add(multilabel_scores, real_multi_label)
-        else:
-            multi_label_meter.add(pred_multi_label, real_multi_label)
+        multi_label_meter.add(multilabel_scores, real_multi_label)
         token_acc_list.append(compute_token_acc(captions, pred_words_list, fake_text_pos_list, tokenizer))
 
     Token_ACC = sum(token_acc_list)/len(token_acc_list) if token_acc_list else 0.0

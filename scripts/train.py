@@ -160,28 +160,27 @@ def create_data_loaders(
     return train_loader, val_loaders
 
 LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
-LETTER_TOKEN_IDS = {'B': 387, 'C': 347, 'D': 495, 'E': 717}
+A_TOKEN_ID = 250
 MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
 
 
-def extract_multilabel_scores_from_logits(lm_logits):
-    """Extract continuous [N,4] scores for B/C/D/E from decoder logits.
+def extract_scores_from_logits(lm_logits):
+    """Extract all continuous scores from the decoder LM logits.
 
-    For multi-label (e.g. "B, D"), each letter may appear at different
-    decoder positions. We take the max probability across ALL positions
-    for each letter token, so that the score for D is not penalized just
-    because it appears at position 2 rather than position 0.
-
-    Args:
-        lm_logits: [batch, seq_len, vocab_size] decoder logits.
     Returns:
-        Tensor [N,4] — per-class continuous scores.
+        binary_scores: [N] — P(fake) = 1 - P(A) at position 0.
+        multilabel_scores: [N,4] — max P(B/C/D/E) across all positions.
     """
     probs = F.softmax(lm_logits, dim=-1)
+
+    p_a = probs[:, 0, A_TOKEN_ID]
+    binary_scores = 1.0 - p_a
+
     token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
     letter_probs = probs[:, :, token_ids]
-    scores, _ = letter_probs.max(dim=1)
-    return scores
+    multilabel_scores, _ = letter_probs.max(dim=1)
+
+    return binary_scores, multilabel_scores
 
 def get_multi_label_from_vectors(vector_answers, device):
     """Build multi_label [N,4] from pre-computed vector_answers and determine real_label positions."""
@@ -300,18 +299,9 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 outputs = model.module(
                     input_ids=input_ids, pixel_values=pixel_values, labels=labels
                 )
-                logits_list = outputs.classification_logits_list
-
-                binary_score = None
-                multilabel_scores = None
-                if logits_list is not None and logits_list[2] is not None:
-                    binary_logits = logits_list[2]
-                    binary_prob = F.softmax(binary_logits, dim=1)
-                    binary_score = binary_prob[:, 0]
 
                 lm_logits = outputs.logits
-                if lm_logits is not None:
-                    multilabel_scores = extract_multilabel_scores_from_logits(lm_logits)
+                binary_score, multilabel_scores = extract_scores_from_logits(lm_logits)
 
                 generated_ids = model.module.generate(
                     input_ids=input_ids,
@@ -339,15 +329,9 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 cls_acc_all += torch.sum(real_label == pred_label).item()
                 
                 all_binary_gt.extend(real_label.cpu().tolist())
-                if binary_score is not None:
-                    all_binary_scores.extend(binary_score.cpu().tolist())
-                else:
-                    all_binary_scores.extend(pred_label.cpu().float().tolist())
+                all_binary_scores.extend(binary_score.cpu().tolist())
 
-                if multilabel_scores is not None:
-                    multi_label_meter.add(multilabel_scores, real_multi_label)
-                else:
-                    multi_label_meter.add(pred_multi_label, real_multi_label)
+                multi_label_meter.add(multilabel_scores, real_multi_label)
 
                 if val_item_count > max_val_item_count:
                     break
