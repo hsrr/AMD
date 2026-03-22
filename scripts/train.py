@@ -160,6 +160,23 @@ def create_data_loaders(
     return train_loader, val_loaders
 
 LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
+LETTER_TOKEN_IDS = {'B': 387, 'C': 347, 'D': 495, 'E': 717}
+MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
+
+
+def extract_multilabel_scores_from_logits(lm_logits):
+    """Extract continuous [N,4] scores for B/C/D/E from decoder first-token logits.
+
+    Args:
+        lm_logits: [batch, seq_len, vocab_size] decoder logits from model forward.
+    Returns:
+        Tensor [N,4] with softmax probabilities for B, C, D, E tokens.
+    """
+    first_token_logits = lm_logits[:, 0, :]
+    probs = F.softmax(first_token_logits, dim=-1)
+    token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
+    scores = probs[:, token_ids]
+    return scores
 
 def get_multi_label_from_vectors(vector_answers, device):
     """Build multi_label [N,4] from pre-computed vector_answers and determine real_label positions."""
@@ -281,10 +298,15 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 logits_list = outputs.classification_logits_list
 
                 binary_score = None
+                multilabel_scores = None
                 if logits_list is not None and logits_list[2] is not None:
                     binary_logits = logits_list[2]
                     binary_prob = F.softmax(binary_logits, dim=1)
                     binary_score = binary_prob[:, 0]
+
+                lm_logits = outputs.logits
+                if lm_logits is not None:
+                    multilabel_scores = extract_multilabel_scores_from_logits(lm_logits)
 
                 generated_ids = model.module.generate(
                     input_ids=input_ids,
@@ -317,7 +339,10 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 else:
                     all_binary_scores.extend(pred_label.cpu().float().tolist())
 
-                multi_label_meter.add(pred_multi_label, real_multi_label)
+                if multilabel_scores is not None:
+                    multi_label_meter.add(multilabel_scores, real_multi_label)
+                else:
+                    multi_label_meter.add(pred_multi_label, real_multi_label)
 
                 if val_item_count > max_val_item_count:
                     break
