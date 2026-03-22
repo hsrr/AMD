@@ -24,11 +24,16 @@ MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
 
 
 def extract_multilabel_scores_from_logits(lm_logits):
-    """Extract continuous [N,4] scores for B/C/D/E from decoder first-token logits."""
-    first_token_logits = lm_logits[:, 0, :]
-    probs = F.softmax(first_token_logits, dim=-1)
+    """Extract continuous [N,4] scores for B/C/D/E from decoder logits.
+
+    Max-pool across all decoder positions so that each letter's score
+    reflects its highest probability at any position (handles multi-label
+    answers like "B, D" where D appears at a later position).
+    """
+    probs = F.softmax(lm_logits, dim=-1)
     token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
-    scores = probs[:, token_ids]
+    letter_probs = probs[:, :, token_ids]
+    scores, _ = letter_probs.max(dim=1)
     return scores
 
 def parse_generated_to_multilabel(generated_texts, device):

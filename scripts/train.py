@@ -165,17 +165,22 @@ MULTI_LABEL_TOKEN_IDS = [387, 347, 495, 717]
 
 
 def extract_multilabel_scores_from_logits(lm_logits):
-    """Extract continuous [N,4] scores for B/C/D/E from decoder first-token logits.
+    """Extract continuous [N,4] scores for B/C/D/E from decoder logits.
+
+    For multi-label (e.g. "B, D"), each letter may appear at different
+    decoder positions. We take the max probability across ALL positions
+    for each letter token, so that the score for D is not penalized just
+    because it appears at position 2 rather than position 0.
 
     Args:
-        lm_logits: [batch, seq_len, vocab_size] decoder logits from model forward.
+        lm_logits: [batch, seq_len, vocab_size] decoder logits.
     Returns:
-        Tensor [N,4] with softmax probabilities for B, C, D, E tokens.
+        Tensor [N,4] — per-class continuous scores.
     """
-    first_token_logits = lm_logits[:, 0, :]
-    probs = F.softmax(first_token_logits, dim=-1)
+    probs = F.softmax(lm_logits, dim=-1)
     token_ids = torch.tensor(MULTI_LABEL_TOKEN_IDS, device=probs.device)
-    scores = probs[:, token_ids]
+    letter_probs = probs[:, :, token_ids]
+    scores, _ = letter_probs.max(dim=1)
     return scores
 
 def get_multi_label_from_vectors(vector_answers, device):
