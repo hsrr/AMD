@@ -18,6 +18,17 @@ import datetime
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def load_json_or_jsonl(path):
+    """Load data from either a JSON array file or a JSONL file."""
+    with open(path, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            pass
+    with open(path, "r") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 LETTER_TO_IDX = {'B': 0, 'C': 1, 'D': 2, 'E': 3}
 
 
@@ -385,8 +396,7 @@ def main():
     log_print(f"test model_id is {args.model_id}")
 
     for val_js in args.vals:
-        with open(val_js, "r") as f:
-            val_data = json.load(f)
+        val_data = load_json_or_jsonl(val_js)
 
         test_dataset = OriDGM4Dataset(split="validation", data=val_data)
         test_loader = DataLoader(

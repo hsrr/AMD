@@ -30,6 +30,19 @@ from torchvision.ops.boxes import box_area
 
 
 
+def load_json_or_jsonl(path):
+    """Load data from either a JSON array file or a JSONL (one JSON object per line) file."""
+    with open(path, "r") as f:
+        try:
+            data = json.load(f)
+            return data
+        except json.JSONDecodeError:
+            pass
+    with open(path, "r") as f:
+        data = [json.loads(line) for line in f if line.strip()]
+    return data
+
+
 def set_seed(seed, rank=0):
 
     seed = seed + rank  
@@ -435,10 +448,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             "docvqa": DocVQADataset(split='validation')
         }
     elif dataset_name == 'DGM4':
-        with open(train_js, "r") as f:
-            train_data = json.load(f)
-        with open(val_js, "r") as f:
-            val_data = json.load(f)
+        train_data = load_json_or_jsonl(train_js)
+        val_data = load_json_or_jsonl(val_js)
             
         train_dataset = DGM4_Dataset(split='train',data=train_data)
         val_datasets = {"DGM4": DGM4_Dataset(split='validation',data=val_data)}
