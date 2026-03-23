@@ -287,8 +287,11 @@ def parse_coordinates(text):
 
 
 def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids):
+    """Returns val_loss (float) for early stopping."""
 
     model.eval()
+    val_loss_sum = 0.0
+    val_loss_count = 0
     with torch.no_grad():
         for val_name, val_loader in val_loaders.items():
             val_item_count = 0
@@ -317,6 +320,10 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 outputs = model.module(
                     input_ids=input_ids, pixel_values=pixel_values, labels=labels
                 )
+
+                if outputs.loss is not None:
+                    val_loss_sum += outputs.loss.item() * len(batch_answers)
+                    val_loss_count += len(batch_answers)
 
                 lm_logits = outputs.logits
                 binary_score, multilabel_scores = extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids)
@@ -372,19 +379,24 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
         except Exception:
             local_CF1 = 0.0
 
+        val_loss = val_loss_sum / val_loss_count if val_loss_count > 0 else float('inf')
+
         local_ACC_cls_tensor = torch.tensor(local_ACC_cls, device=device)
         local_MAP_tensor = torch.tensor(local_MAP, device=device)
         local_AUC_tensor = torch.tensor(local_AUC, device=device)
         local_CF1_tensor = torch.tensor(local_CF1, device=device)
+        local_val_loss_tensor = torch.tensor(val_loss, device=device)
 
         ACC_cls = synchronize_metrics(local_ACC_cls_tensor, world_size)
         MAP = synchronize_metrics(local_MAP_tensor, world_size)
         AUC = synchronize_metrics(local_AUC_tensor, world_size)
         CF1 = synchronize_metrics(local_CF1_tensor, world_size)
+        val_loss_synced = synchronize_metrics(local_val_loss_tensor, world_size)
 
         if dist.get_rank() == 0:
-            print(f"Rank {rank} - Step {global_step} - binary_acc={ACC_cls.item():.4f}, binary_auc={AUC.item():.4f}, mAP={MAP.item():.4f}, CF1={CF1.item():.4f}")
+            print(f"Rank {rank} - Step {global_step} - val_loss={val_loss_synced.item():.4f}, binary_acc={ACC_cls.item():.4f}, binary_auc={AUC.item():.4f}, mAP={MAP.item():.4f}, CF1={CF1.item():.4f}")
             wandb.log({
+                f"{val_name}_val_loss": val_loss_synced.item(),
                 f"{val_name}_binary_acc": ACC_cls.item(),
                 f"{val_name}_binary_auc": AUC.item(),
                 f"{val_name}_mAP": MAP.item(),
@@ -393,10 +405,11 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
             })
             
     model.train()
+    return val_loss_synced.item()
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT',random_seed=12):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT', random_seed=12, patience=3):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
@@ -509,6 +522,14 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         num_training_steps=num_training_steps,
     )
     global_step = 0
+
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+
+    out_put_prefix = './AMD_log'
+    best_model_dir = os.path.join(out_put_prefix, f'train_{train_time}', 'best')
+    if rank == 0:
+        os.makedirs(best_model_dir, exist_ok=True)
 
     for epoch in range(epochs):
         # Training phase
@@ -624,7 +645,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             if global_step % eval_steps == 0:
                 evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
 
-        evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
+        val_loss = evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
 
         # Log training loss to wandb
         avg_train_loss = train_loss / len(train_loader)
@@ -643,16 +664,35 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
 
         # Save model checkpoint
-        if rank == 0:  # Only the main process saves the checkpoint
-            out_put_prefix = './AMD_log'
-            output_dir = os.path.join(out_put_prefix,f"./train_{train_time}/epoch_{epoch+1}")
-            
+        if rank == 0:
+            output_dir = os.path.join(out_put_prefix, f'train_{train_time}', f'epoch_{epoch+1}')
             os.makedirs(output_dir, exist_ok=True)
             model.module.save_pretrained(output_dir)
             processor.save_pretrained(output_dir)
 
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            if rank == 0:
+                model.module.save_pretrained(best_model_dir)
+                processor.save_pretrained(best_model_dir)
+                print(f'  -> Best model saved (val_loss={val_loss:.4f})')
+        else:
+            epochs_no_improve += 1
+            if rank == 0:
+                print(f'  -> No improvement ({epochs_no_improve}/{patience})')
+
+        if epochs_no_improve >= patience:
+            if rank == 0:
+                print(f'Early stopping at epoch {epoch + 1}')
+            break
+
+        dist.barrier()
+
     # Finish the wandb run
     if rank == 0:
+        print(f'Training finished. Best val_loss={best_val_loss:.4f}')
         wandb.finish()
 
     cleanup()
@@ -674,6 +714,7 @@ def main():
     parser.add_argument("--val-js", type=str, default='./val.json', help="json file for val")
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience (epochs without improvement)")
     
     
     
@@ -686,7 +727,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.patience),
         nprocs=world_size,
         join=True
     )
