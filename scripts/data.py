@@ -57,32 +57,18 @@ TYPE_TO_CLASS_ID = {
     'text_attribute': 4,
 }
 
-TASK_TEMPLATES = """You are a forensic expert specializing in multi-modal fake news detection. Your core task is to analyze the provided News Image and Caption to identify any manipulation by evaluating their semantic consistency.
+TASK_TEMPLATES = """Detect manipulation in this news image-caption pair.
 
-News Caption: {}
+Caption: {}
 
-Analyze the content based on the following 5 categories and select ALL applicable option letters.
+Select ALL that apply:
+A. Real - no manipulation
+B. Face Swap - identity replaced
+C. Face Attribute - expression/emotion altered
+D. Text Swap - semantic replaced with unrelated event
+E. Text Attribute - sentiment words changed to opposite
 
-Options:
-A. Real News:
-   Both the image and text are authentic and semantically consistent, with no artificial manipulation traces.
-
-B. Face Swap (FS - Image Manipulation):
-   The identity of the main character is attacked by swapping their face with another person's features. Look for identity inconsistency and visual artifacts like blurring or mismatched skin tones.
-
-C. Face Attribute (FA - Image Manipulation):
-   The character's identity is preserved, but their facial expression or emotion has been modified by AI (e.g., changing a smile to anger or dejection). Check if the facial emotion contradicts the news context.
-
-D. Text Swap (TS - Text Manipulation):
-   The person's name (entity) is preserved, but the overall news semantic is replaced with an unrelated event. Identify if the described actions or locations result in an "out-of-context" mismatch with the visual scene.
-
-E. Text Attribute (TA - Text Manipulation):
-   Specific sentiment words or biases are modified to the opposite emotion (e.g., changing positive words to "forced", "resign", or "mourn"). Check if the caption's sentiment directly contradicts the character's expression or the atmosphere in the image.
-
-Instructions:
-- If the news is authentic, output ONLY: A
-- If manipulation exists, output the letters of ALL detected types, separated by commas (e.g., "B, D" or "B").
-- DO NOT explain your reasoning. Output ONLY the option letters.
+If authentic, output A. Otherwise output all detected types separated by commas.
 
 Answer:"""
 
