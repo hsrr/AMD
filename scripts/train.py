@@ -596,12 +596,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                         loss_list.append(temp_loss2)
                         
                     if i == 3:
-                        output_coords = logits.to(device)
-                        tensor_fake_image_box = torch.cat(fake_image_box, dim=0).reshape(len(fake_image_box), -1).to(device)
-                        loss_bbox, loss_giou = get_bbox_loss(output_coords, tensor_fake_image_box)
-                        total_loss += 0.0 * (loss_bbox + loss_giou)
-                        loss_list.append(loss_bbox)
-                        loss_list.append(loss_giou)
+                        total_loss += 0.0 * logits.sum()
+                        loss_list.append(torch.tensor(0.0, device=device))
+                        loss_list.append(torch.tensor(0.0, device=device))
                     
                     if i == 4: 
                         loss_regular = logits.to(device)
