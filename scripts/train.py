@@ -3,6 +3,7 @@ import os
 import json
 import re
 from functools import partial
+from contextlib import nullcontext
 from datetime import datetime
 import friendlywords as fw
 import torch
@@ -64,6 +65,14 @@ def setup(rank, world_size):
 
 def cleanup():
     dist.destroy_process_group()
+
+
+def get_autocast_context(precision: str):
+    if precision == "bf16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if precision == "fp16":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
 
 
 def get_bbox_loss(output_coord, target_bbox, is_image=None):
@@ -159,11 +168,12 @@ def create_data_loaders(
     )
 
     val_loaders = {}
+    val_batch_size = max(1, batch_size // 2)
     for name, val_dataset in val_datasets.items():
         val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size//2,
+            batch_size=val_batch_size,
             collate_fn=partial(collate_fn, processor=processor, device=device),
             num_workers=num_workers,
             sampler=val_sampler,
@@ -286,7 +296,7 @@ def parse_coordinates(text):
         return torch.tensor([[0, 0, 0, 0]])
 
 
-def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids):
+def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids, precision):
     """Returns val_loss (float) for early stopping."""
 
     model.eval()
@@ -317,9 +327,10 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                     max_length=800,
                 ).input_ids.to(device)
 
-                outputs = model.module(
-                    input_ids=input_ids, pixel_values=pixel_values, labels=labels
-                )
+                with get_autocast_context(precision):
+                    outputs = model.module(
+                        input_ids=input_ids, pixel_values=pixel_values, labels=labels
+                    )
 
                 if outputs.loss is not None:
                     val_loss_sum += outputs.loss.item() * len(batch_answers)
@@ -328,12 +339,13 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
                 lm_logits = outputs.logits
                 binary_score, multilabel_scores = extract_scores_from_logits(lm_logits, a_token_id, multi_label_token_ids)
 
-                generated_ids = model.module.generate(
-                    input_ids=input_ids,
-                    pixel_values=pixel_values,
-                    max_new_tokens=1024,
-                    num_beams=3,
-                )
+                with get_autocast_context(precision):
+                    generated_ids = model.module.generate(
+                        input_ids=input_ids,
+                        pixel_values=pixel_values,
+                        max_new_tokens=1024,
+                        num_beams=3,
+                    )
                 generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=False)
                 
                 task_answers = []
@@ -409,10 +421,16 @@ def evaluate_model(rank, world_size, model, val_loaders, device, train_loss, pro
 
 
 
-def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT', random_seed=12, patience=3):
+def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, batch_size=6, use_lora=False, epochs=10, lr=1e-6, eval_steps=10, run_name=None, max_val_item_count=1000, regular_weight=0.07, train_domain='NYT', random_seed=12, patience=3, grad_accum_steps=1, precision="bf16", gradient_checkpointing=False):
     setup(rank, world_size)
     set_seed(random_seed, rank)
     device = torch.device(f"cuda:{rank}")
+    if precision == "bf16" and not torch.cuda.is_bf16_supported():
+        if rank == 0:
+            print("bf16 is not supported on this GPU, falling back to fp16.")
+        precision = "fp16"
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
     train_data=[]
     val_data=[]
     
@@ -442,6 +460,9 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             "learning_rate": lr,
             "eval_steps": eval_steps,
             "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "precision": precision,
+            "gradient_checkpointing": gradient_checkpointing,
         })
 
     # Load the dataset based on the dataset_name argument
@@ -470,12 +491,24 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Load the model and processor
+    pretrained_kwargs = {"trust_remote_code": True}
+    if precision == "bf16":
+        pretrained_kwargs["torch_dtype"] = torch.bfloat16
+    elif precision == "fp16":
+        pretrained_kwargs["torch_dtype"] = torch.float16
     model = AutoModelForCausalLM.from_pretrained(
-        AMD_init_pth, trust_remote_code=True
+        AMD_init_pth, **pretrained_kwargs
     ).to(device)
     processor = AutoProcessor.from_pretrained(
         AMD_init_pth, trust_remote_code=True
     )
+
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    if gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
     a_token_id, multi_label_token_ids = get_letter_token_ids(processor.tokenizer)
 
@@ -522,6 +555,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         num_training_steps=num_training_steps,
     )
     global_step = 0
+    scaler = torch.cuda.amp.GradScaler(enabled=(precision == "fp16"))
 
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -541,9 +575,10 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
         text_loss = 0
         LT_loss = 0
         loss_regular = 0
-        for batch in tqdm(
+        optimizer.zero_grad(set_to_none=True)
+        for batch_idx, batch in enumerate(tqdm(
             train_loader, desc=f"Training Epoch {epoch + 1}/{epochs}", position=rank
-        ):
+        )):
             inputs, answers, fake_image_box, vector_answers = batch
 
             # Prepare the input and target tensors
@@ -558,62 +593,73 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                 max_length=800,
             ).input_ids.to(device)
 
-            outputs = model(
-                input_ids=input_ids, pixel_values=pixel_values, labels=labels
-            )
-            total_loss = outputs.loss
-            Binary_lables = []
-            for tt, label in enumerate(answers):
-                if label.startswith('A'):
-                    Binary_lables.append(1)  
-                else:
-                    Binary_lables.append(0)  
-                    
-            Binary_lables = torch.tensor(Binary_lables, dtype=torch.long).to(device)
-
-            logits_list = outputs.classification_logits_list
-            ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
-            
-            for i,logits in enumerate(logits_list):
-                if logits is not None:
-                    if i == 0:
-                        temp_loss0 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss0):
-                            raise RuntimeError(f"logits_list[{i}] NaN in temp_loss0")
-                        total_loss += 0.1*temp_loss0 
-                        loss_list.append(temp_loss0)
-                    if i == 1:
-                        temp_loss1 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss1):
-                            raise RuntimeError(f"logits_list[{i}] NaN in temp_loss1")
-                        total_loss += 0.1*temp_loss1 
-                        loss_list.append(temp_loss1)
-                    if i == 2:
-                        temp_loss2 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss2):
-                            raise RuntimeError(f"logits_list[{i}] NaN in temp_loss2")
-                        total_loss += 0.1*temp_loss2 
-                        loss_list.append(temp_loss2)
+            with get_autocast_context(precision):
+                outputs = model(
+                    input_ids=input_ids, pixel_values=pixel_values, labels=labels
+                )
+                total_loss = outputs.loss
+                Binary_lables = []
+                for tt, label in enumerate(answers):
+                    if label.startswith('A'):
+                        Binary_lables.append(1)  
+                    else:
+                        Binary_lables.append(0)  
                         
-                    if i == 3:
-                        total_loss += 0.0 * logits.sum()
-                        loss_list.append(torch.tensor(0.0, device=device))
-                        loss_list.append(torch.tensor(0.0, device=device))
-                    
-                    if i == 4: 
-                        loss_regular = logits.to(device)
-                        if torch.isnan(loss_regular):
-                            raise RuntimeError(f"logits_list[{i}] NaN in loss_regular")
-                        loss_regular = regular_weight * loss_regular
-                        loss_list.append(loss_regular)
-                        total_loss += loss_regular
+                Binary_lables = torch.tensor(Binary_lables, dtype=torch.long).to(device)
 
-    
-            total_loss.backward()
+                logits_list = outputs.classification_logits_list
+                ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
+                
+                for i,logits in enumerate(logits_list):
+                    if logits is not None:
+                        if i == 0:
+                            temp_loss0 = criterion(logits,Binary_lables) 
+                            if torch.isnan(temp_loss0):
+                                raise RuntimeError(f"logits_list[{i}] NaN in temp_loss0")
+                            total_loss += 0.1*temp_loss0 
+                            loss_list.append(temp_loss0)
+                        if i == 1:
+                            temp_loss1 = criterion(logits,Binary_lables) 
+                            if torch.isnan(temp_loss1):
+                                raise RuntimeError(f"logits_list[{i}] NaN in temp_loss1")
+                            total_loss += 0.1*temp_loss1 
+                            loss_list.append(temp_loss1)
+                        if i == 2:
+                            temp_loss2 = criterion(logits,Binary_lables) 
+                            if torch.isnan(temp_loss2):
+                                raise RuntimeError(f"logits_list[{i}] NaN in temp_loss2")
+                            total_loss += 0.1*temp_loss2 
+                            loss_list.append(temp_loss2)
+                            
+                        if i == 3:
+                            total_loss += 0.0 * logits.sum()
+                            loss_list.append(torch.tensor(0.0, device=device))
+                            loss_list.append(torch.tensor(0.0, device=device))
+                        
+                        if i == 4: 
+                            loss_regular = logits.to(device)
+                            if torch.isnan(loss_regular):
+                                raise RuntimeError(f"logits_list[{i}] NaN in loss_regular")
+                            loss_regular = regular_weight * loss_regular
+                            loss_list.append(loss_regular)
+                            total_loss += loss_regular
 
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+            loss_for_backward = total_loss / grad_accum_steps
+            if scaler.is_enabled():
+                scaler.scale(loss_for_backward).backward()
+            else:
+                loss_for_backward.backward()
+
+            should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
+            if should_step:
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
 
             train_loss += total_loss.item()
             LLM_loss += outputs.loss.item()
@@ -626,7 +672,7 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
             
             
             
-            if rank == 0:
+            if rank == 0 and should_step:
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
@@ -637,12 +683,11 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
                 wandb.log({"step": global_step + 1, "step_avg_regular_loss": step_regular_loss})
                 
             loss_list.clear()    
-            global_step += 1
 
-            if global_step % eval_steps == 0:
-                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
+            if should_step and global_step % eval_steps == 0:
+                evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids, precision)
 
-        val_loss = evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids)
+        val_loss = evaluate_model(rank, world_size, model, val_loaders, device, train_loss, processor, global_step, batch_size, max_val_item_count, a_token_id, multi_label_token_ids, precision)
 
         # Log training loss to wandb
         avg_train_loss = train_loss / len(train_loader)
@@ -698,8 +743,8 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 def main():
     parser = argparse.ArgumentParser(description="Train AMD model on specified dataset")
     parser.add_argument("--AMD-init-pth", type=str, help="AMD model dir")
-    parser.add_argument("--dataset-type", type=str, default="DGM4", choices=["docvqa", "cauldron", "vqainstruct","DGM4"], help="Dataset to train on")
-    parser.add_argument("--batch-size", type=int, default=5, help="Batch size for training") 
+    parser.add_argument("--dataset-type", "--dataset", dest="dataset_type", type=str, default="DGM4", choices=["docvqa", "cauldron", "vqainstruct","DGM4"], help="Dataset to train on")
+    parser.add_argument("--batch-size", type=int, default=5, help="Per-GPU micro-batch size for training") 
     parser.add_argument("--use-lora", action='store_true', help="Use LoRA if this flag is passed")
     parser.add_argument("--epochs", type=int, default=13, help="Number of epochs to train for")
     parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate")
@@ -712,6 +757,9 @@ def main():
     parser.add_argument("--train-domain", type=str, default='NYT', help="News domain of train data")
     parser.add_argument("--seed", type=int, default=12, help="random seed, small is better")
     parser.add_argument("--patience", type=int, default=3, help="Early stopping patience (epochs without improvement)")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Number of gradient accumulation steps")
+    parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16", "fp16"], help="Training precision mode")
+    parser.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to reduce activation memory")
     
     
     
@@ -724,7 +772,7 @@ def main():
     world_size = torch.cuda.device_count()
     mp.spawn(
         train_model,
-        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.patience),
+        args=(args.AMD_init_pth, args.train_js, args.val_js, world_size, args.dataset_type, args.batch_size, args.use_lora, args.epochs, args.lr, args.eval_steps, args.run_name, args.max_val_item_count, args.regular_weight, args.train_domain, args.seed, args.patience, args.grad_accum_steps, args.precision, args.gradient_checkpointing),
         nprocs=world_size,
         join=True
     )
