@@ -563,64 +563,79 @@ def train_model(rank, AMD_init_pth, train_js, val_js, world_size, dataset_name, 
 
             logits_list = outputs.classification_logits_list
             ### logits = [image_classification, text_classification,learnable_token_logits,output_coord,loss_regular]
-            
-            for i,logits in enumerate(logits_list):
-                if logits is not None:
-                    if i == 0:
-                        temp_loss0 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss0):
-                            raise RuntimeError(f"logits_list[{i}] NaN in temp_loss0")
-                        total_loss += 0.1*temp_loss0 
-                        loss_list.append(temp_loss0)
-                    if i == 1:
-                        temp_loss1 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss1):
-                            raise RuntimeError(f"logits_list[{i}] NaN in temp_loss1")
-                        total_loss += 0.1*temp_loss1 
-                        loss_list.append(temp_loss1)
-                    if i == 2:
-                        temp_loss2 = criterion(logits,Binary_lables) 
-                        if torch.isnan(temp_loss2):
-                            raise RuntimeError(f"logits_list[{i}] NaN in temp_loss2")
-                        total_loss += 0.1*temp_loss2 
-                        loss_list.append(temp_loss2)
-                        
-                    if i == 3:
-                        loss_list.append(torch.tensor(0.0, device=device))
-                        loss_list.append(torch.tensor(0.0, device=device))
-                    
-                    if i == 4: 
-                        loss_regular = logits.to(device)
-                        if torch.isnan(loss_regular):
-                            raise RuntimeError(f"logits_list[{i}] NaN in loss_regular")
-                        loss_regular = regular_weight * loss_regular
-                        loss_list.append(loss_regular)
-                        total_loss += loss_regular
+            step_image_loss = torch.tensor(0.0, device=device)
+            step_text_loss = torch.tensor(0.0, device=device)
+            step_lt_loss = torch.tensor(0.0, device=device)
+            step_bbox_loss = torch.tensor(0.0, device=device)
+            step_giou_loss = torch.tensor(0.0, device=device)
+            step_regular_loss = torch.tensor(0.0, device=device)
 
-    
+            for i, logits in enumerate(logits_list):
+                if logits is None:
+                    continue
+
+                if i in (0, 1, 2):
+                    # Guard against numerical explosions in auxiliary logits.
+                    safe_logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+                    aux_loss = criterion(safe_logits, Binary_lables)
+                    if not torch.isfinite(aux_loss):
+                        print(f"[Rank {rank}] skip non-finite aux loss at logits_list[{i}]")
+                        continue
+                    total_loss = total_loss + 0.1 * aux_loss
+                    if i == 0:
+                        step_image_loss = aux_loss
+                    elif i == 1:
+                        step_text_loss = aux_loss
+                    else:
+                        step_lt_loss = aux_loss
+                    continue
+
+                if i == 3:
+                    # Placeholder branch in current model output format.
+                    continue
+
+                if i == 4:
+                    safe_regular = torch.nan_to_num(logits.to(device), nan=0.0, posinf=0.0, neginf=0.0)
+                    safe_regular = regular_weight * safe_regular
+                    if torch.isfinite(safe_regular):
+                        step_regular_loss = safe_regular
+                        total_loss = total_loss + safe_regular
+                    else:
+                        print(f"[Rank {rank}] skip non-finite regular loss from logits_list[{i}]")
+
+            if not torch.isfinite(total_loss):
+                print(f"[Rank {rank}] skip step due to non-finite total_loss")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if not torch.isfinite(grad_norm):
+                print(f"[Rank {rank}] skip optimizer step due to non-finite grad_norm")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             train_loss += total_loss.item()
             LLM_loss += outputs.loss.item()
-            image_loss += loss_list[0].item()
-            text_loss += loss_list[1].item()
-            LT_loss += loss_list[2].item()
-            step_bbox_loss = loss_list[3].item()
-            step_giou_loss = loss_list[4].item()
-            step_regular_loss = loss_list[5].item()
+            image_loss += step_image_loss.item()
+            text_loss += step_text_loss.item()
+            LT_loss += step_lt_loss.item()
+            step_bbox_loss = step_bbox_loss.item()
+            step_giou_loss = step_giou_loss.item()
+            step_regular_loss = step_regular_loss.item()
             
             
             
             if rank == 0:
                 wandb.log({"step": global_step + 1, "step_train_loss": total_loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_LLM_loss": outputs.loss.item()})
-                wandb.log({"step": global_step + 1, "step_avg_image_loss": loss_list[0].item()})
-                wandb.log({"step": global_step + 1, "step_avg_text_loss": loss_list[1].item()})
-                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": loss_list[2].item()})
+                wandb.log({"step": global_step + 1, "step_avg_image_loss": step_image_loss.item()})
+                wandb.log({"step": global_step + 1, "step_avg_text_loss": step_text_loss.item()})
+                wandb.log({"step": global_step + 1, "step_avg_LearnableToken_loss": step_lt_loss.item()})
                 wandb.log({"step": global_step + 1, "step_avg_bbox_loss": step_bbox_loss})
                 wandb.log({"step": global_step + 1, "step_avg_giou_loss": step_giou_loss})
                 wandb.log({"step": global_step + 1, "step_avg_regular_loss": step_regular_loss})
